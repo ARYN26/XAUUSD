@@ -905,8 +905,9 @@ def build_attention_lstm_model(input_shape, complexity='medium', dropout_rate=0.
     """
     Build LSTM model with attention mechanism based on research findings
     """
+    # Fix: Ensure all complexity levels have at least 3 elements in units list
     if complexity == 'low':
-        units = [64, 32]
+        units = [64, 48, 32]  # Added a middle value to avoid index error
     elif complexity == 'medium':
         units = [128, 64, 32]
     elif complexity == 'high':
@@ -934,7 +935,7 @@ def build_attention_lstm_model(input_shape, complexity='medium', dropout_rate=0.
     # Attention layer
     attention_layer = Attention()([drop_2, drop_2])
 
-    # Third LSTM layer
+    # Third LSTM layer - now units[2] will always exist
     lstm_3 = LSTM(units[2],
                   recurrent_dropout=dropout_rate,
                   recurrent_regularizer=l1_l2(l1=1e-5, l2=1e-5))(attention_layer)
@@ -1835,25 +1836,59 @@ def save_model_and_metadata(model, scaler, feature_list, best_params, test_metri
     with open(os.path.join(MODEL_DIR, 'feature_list.pkl'), 'wb') as f:
         pickle.dump(feature_list, f)
 
-    # Save metadata
+    # Convert test_metrics to JSON-serializable format
+    serializable_metrics = {}
+    for k, v in test_metrics.items():
+        if k not in ['predictions', 'actual', 'regime_data']:
+            if isinstance(v, (np.float32, np.float64)):
+                serializable_metrics[k] = float(v)
+            elif isinstance(v, (np.int32, np.int64)):
+                serializable_metrics[k] = int(v)
+            elif isinstance(v, np.bool_):
+                serializable_metrics[k] = bool(v)
+            elif isinstance(v, np.ndarray):
+                continue  # Skip arrays
+            else:
+                serializable_metrics[k] = v
+
+    # Make sure hyperparameters are also serializable
+    serializable_params = {}
+    for k, v in best_params.items():
+        if isinstance(v, (np.bool_, bool)):
+            serializable_params[k] = bool(v)
+        elif isinstance(v, (np.int32, np.int64)):
+            serializable_params[k] = int(v)
+        elif isinstance(v, (np.float32, np.float64)):
+            serializable_params[k] = float(v)
+        else:
+            serializable_params[k] = v
+
+    # Create metadata dictionary with JSON-safe values
     metadata = {
-        'hyperparameters': best_params,
-        'test_metrics': {k: float(v) if isinstance(v, np.float32) else v
-                         for k, v in test_metrics.items()
-                         if k not in ['predictions', 'actual', 'regime_data']},
-        'feature_count': len(feature_list),
+        'hyperparameters': serializable_params,
+        'test_metrics': serializable_metrics,
+        'feature_count': int(len(feature_list)),  # Ensure it's a regular int
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'is_ensemble': is_ensemble,
-        'ensemble_size': len(ensemble_models) if is_ensemble and ensemble_models else 1,
-        'model_type': best_params['model_type'] if not is_ensemble else 'ensemble',
+        'is_ensemble': bool(is_ensemble),  # Convert to regular Python bool
+        'ensemble_size': int(len(ensemble_models) if is_ensemble and ensemble_models else 1),
+        'model_type': serializable_params.get('model_type', 'ensemble') if not is_ensemble else 'ensemble',
         'symbol': SYMBOL,
-        'lookback': LOOKBACK
+        'lookback': int(LOOKBACK)  # Ensure it's a regular int
     }
 
-    with open(os.path.join(MODEL_DIR, 'metadata.json'), 'w') as f:
-        json.dump(metadata, f, indent=4)
-
-    logger.info(f"Model and metadata saved to {MODEL_DIR}")
+    # Save metadata
+    try:
+        with open(os.path.join(MODEL_DIR, 'metadata.json'), 'w') as f:
+            json.dump(metadata, f, indent=4)
+        logger.info(f"Model and metadata saved to {MODEL_DIR}")
+    except TypeError as e:
+        logger.error(f"Error saving metadata: {e}")
+        # Print the metadata content for debugging
+        for key, value in metadata.items():
+            logger.info(f"Metadata key '{key}' has type {type(value)}")
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    logger.info(f"  Subkey '{k}' has type {type(v)}")
 
 
 def main():

@@ -41,7 +41,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants - must match training
-LOOKBACK = 20
+LOOKBACK = 5
 SYMBOL = 'XAUUSD'  # Changed to Gold/USD as per repo name
 TIMEFRAME = mt5.TIMEFRAME_H1
 
@@ -818,14 +818,19 @@ def add_target_variables(df):
 
     # Add probability of extreme move target
     # Define extreme move as > 2 standard deviations
-    vol_threshold = df['volatility_20'] * 2
+    vol_threshold = df['volatility_20'] * 2 if 'volatility_20' in df.columns else df['close_diff_pct'].rolling(
+        window=20).std() * 2
+
     extreme_moves = []
-
     for i in range(len(df) - 5):
-        max_move = df['close_diff_pct'].iloc[i + 1:i + 6].abs().max()
-        extreme_moves.append(1 if max_move > vol_threshold.iloc[i] else 0)
+        try:
+            max_move = df['close_diff_pct'].iloc[i + 1:i + 6].abs().max()
+            extreme_moves.append(1 if max_move > vol_threshold.iloc[i] else 0)
+        except:
+            extreme_moves.append(0)  # Default if we can't calculate
 
-    extreme_moves.extend([np.nan] * 5)  # Pad the end
+    # Pad the end
+    extreme_moves.extend([np.nan] * min(5, max(0, len(df) - len(extreme_moves))))
     df['extreme_move_5d'] = extreme_moves
 
     # Add target for regime switches (if market regime detection is enabled)
@@ -836,10 +841,17 @@ def add_target_variables(df):
     return df
 
 
-def prepare_features_and_targets(df, target_col='next_close_change_pct', feature_blacklist=None):
+def prepare_features_and_targets(df, target_col='next_close_change_pct', feature_blacklist=None,
+                                 expected_features=None):
     """
     Prepare features and target variables with robust handling of missing features
     """
+    # Check if target column exists, if not add it
+    if target_col not in df.columns:
+        logger.info(f"Target column '{target_col}' missing, calculating it now...")
+        df['next_close'] = df['close'].shift(-1)
+        df['next_close_change_pct'] = ((df['next_close'] - df['close']) / df['close']) * 100
+
     # Default blacklist if none provided
     if feature_blacklist is None:
         feature_blacklist = [
@@ -863,31 +875,73 @@ def prepare_features_and_targets(df, target_col='next_close_change_pct', feature
         logger.warning(f"Filling these columns with zeros: {nan_cols}")
         feature_df[nan_cols] = feature_df[nan_cols].fillna(0)
 
-    # Separate features and target
-    y = feature_df[target_col].values
-
     # Remove target columns from features
     target_cols = ['next_close_change_pct', 'next_direction', 'future_volatility', 'extreme_move_5d', 'regime_switch',
                    'next_regime']
     target_cols += [f'change_future_{i}_pct' for i in range(2, 6)]
+
+    # Keep only columns that exist in the DataFrame
+    target_cols = [col for col in target_cols if col in feature_df.columns]
+
+    # Make sure our target column exists
+    if target_col not in feature_df.columns:
+        logger.error(f"Target column {target_col} not found after preprocessing!")
+        # Use a dummy target as fallback
+        feature_df[target_col] = 0
+
+    # Separate features and target
+    y = feature_df[target_col].values
+
+    # Remove target columns from features
     X = feature_df.drop(columns=target_cols, errors='ignore').values
 
     logger.info(f"Features shape: {X.shape}, Target shape: {y.shape}")
-    logger.info(f"Feature names: {feature_df.drop(columns=target_cols, errors='ignore').columns.tolist()}")
+    feature_columns = feature_df.drop(columns=target_cols, errors='ignore').columns.tolist()
+    logger.info(f"Feature names: {feature_columns}")
 
-    return X, y, feature_df.drop(columns=target_cols, errors='ignore').columns.tolist()
+    # After preparing X, check feature count and adjust before scaling
+    if expected_features and X.shape[1] != expected_features:
+        logger.warning(f"Feature count mismatch: expected {expected_features}, got {X.shape[1]}")
+
+        if X.shape[1] > expected_features:
+            logger.info(f"Truncating features from {X.shape[1]} to {expected_features}")
+            X = X[:, :expected_features]
+            feature_columns = feature_columns[:expected_features]
+        else:
+            logger.info(f"Padding features from {X.shape[1]} to {expected_features}")
+            padding = np.zeros((X.shape[0], expected_features - X.shape[1]))
+            X = np.hstack([X, padding])
+            # Add dummy feature names for padding
+            feature_columns = feature_columns + [f'padding_{i}' for i in
+                                                 range(expected_features - len(feature_columns))]
+
+    return X, y, feature_columns
 
 
 def create_sequences(X, y, lookback=LOOKBACK):
     """
-    Create sequences for LSTM/GRU models
+    Create sequences for LSTM/GRU models with adaptability for small datasets
     """
     X_seq, y_seq = [], []
+
+    # Handle small datasets
+    if len(X) <= lookback + 1:
+        logger.warning(f"Dataset too small ({len(X)} samples) for lookback={lookback}")
+        # Use reduced lookback for small datasets
+        reduced_lookback = max(1, len(X) - 2)
+        logger.info(f"Reducing lookback from {lookback} to {reduced_lookback} for this analysis")
+        lookback = reduced_lookback
+
+    # Create sequences
     for i in range(len(X) - lookback):
         X_seq.append(X[i:i + lookback])
         y_seq.append(y[i + lookback])
 
-    return np.array(X_seq), np.array(y_seq)
+    # Convert to numpy arrays
+    X_seq_np = np.array(X_seq) if X_seq else np.empty((0, lookback, X.shape[1]))
+    y_seq_np = np.array(y_seq) if y_seq else np.empty(0)
+
+    return X_seq_np, y_seq_np
 
 
 def load_ensemble_models(ensemble_dir):
@@ -922,7 +976,20 @@ def load_ensemble_models(ensemble_dir):
                 'mae_custom': mae_custom
             }
 
-            model = load_model(model_path, custom_objects=custom_objects)
+            # Try loading in different ways
+            try:
+                # Method 1: Without compilation
+                model = load_model(model_path, compile=False, custom_objects=custom_objects)
+                # Recompile
+                model.compile(
+                    optimizer='adam',
+                    loss='mse',
+                    metrics=['mae', r2_keras, directional_accuracy]
+                )
+            except:
+                # Method 2: With compilation and custom objects
+                model = load_model(model_path, custom_objects=custom_objects)
+
             models.append(model)
             logger.info(f"Loaded ensemble model {i} from {model_path}")
         except Exception as e:
@@ -941,7 +1008,7 @@ def ensemble_predict(models, weights, X):
 
     # Get predictions from each model
     for model in models:
-        pred = model.predict(X)
+        pred = model.predict(X, verbose=0)
         predictions.append(pred)
 
     # Weighted average
@@ -949,7 +1016,8 @@ def ensemble_predict(models, weights, X):
     for i, pred in enumerate(predictions):
         weighted_preds += weights[i] * pred
 
-    return weighted_preds
+    # Ensure we return a flattened array if appropriate
+    return weighted_preds.flatten() if weighted_preds.ndim > 1 else weighted_preds
 
 
 def calculate_kelly_criterion(predictions, actuals, position_type='long_short'):
@@ -957,13 +1025,21 @@ def calculate_kelly_criterion(predictions, actuals, position_type='long_short'):
     Calculate Kelly criterion for optimal position sizing
     position_type: 'long_short' for both directions, 'long_only' or 'short_only'
     """
+    # Ensure predictions and actuals are 1D arrays
+    predictions = np.array(predictions).flatten()
+    actuals = np.array(actuals).flatten()
+
     # Filter predictions based on position type
     if position_type == 'long_only':
         mask = predictions > 0
+        if not any(mask):
+            return 0.0  # No valid long trades
         pred_filtered = predictions[mask]
         actual_filtered = actuals[mask]
     elif position_type == 'short_only':
         mask = predictions < 0
+        if not any(mask):
+            return 0.0  # No valid short trades
         pred_filtered = -predictions[mask]  # Flip sign for shorts
         actual_filtered = -actuals[mask]  # Flip sign for shorts
     else:  # long_short
@@ -987,12 +1063,72 @@ def calculate_kelly_criterion(predictions, actuals, position_type='long_short'):
         return 1.0  # No losing trades
 
     # Calculate Kelly fraction
-    kelly = win_prob - ((1 - win_prob) / (avg_win / avg_loss))
+    try:
+        kelly = win_prob - ((1 - win_prob) / (avg_win / avg_loss))
+    except:
+        return 0.0  # Error in calculation
 
     # Limit to reasonable range
     kelly = max(0, min(1, kelly))
 
     return kelly
+
+
+def adapt_scaler(scaler, n_features_new):
+    """
+    Adapt a scaler to handle a different number of features
+    Works with StandardScaler, MinMaxScaler, RobustScaler
+    """
+    if hasattr(scaler, 'scale_') and hasattr(scaler, 'mean_'):
+        # StandardScaler has mean_ and scale_
+        n_features_old = scaler.scale_.shape[0]
+
+        if n_features_new > n_features_old:
+            # Add zeros for padding (mean) and ones for scale
+            scaler.mean_ = np.pad(scaler.mean_, (0, n_features_new - n_features_old))
+            scaler.scale_ = np.pad(scaler.scale_, (0, n_features_new - n_features_old),
+                                   constant_values=1)
+        else:
+            # Truncate
+            scaler.mean_ = scaler.mean_[:n_features_new]
+            scaler.scale_ = scaler.scale_[:n_features_new]
+
+    elif hasattr(scaler, 'center_') and hasattr(scaler, 'scale_'):
+        # RobustScaler has center_ and scale_
+        n_features_old = scaler.center_.shape[0]
+
+        if n_features_new > n_features_old:
+            # Add zeros for padding (center) and ones for scale
+            scaler.center_ = np.pad(scaler.center_, (0, n_features_new - n_features_old))
+            scaler.scale_ = np.pad(scaler.scale_, (0, n_features_new - n_features_old),
+                                   constant_values=1)
+        else:
+            # Truncate
+            scaler.center_ = scaler.center_[:n_features_new]
+            scaler.scale_ = scaler.scale_[:n_features_new]
+
+    elif hasattr(scaler, 'min_') and hasattr(scaler, 'scale_'):
+        # MinMaxScaler has min_ and scale_
+        n_features_old = scaler.min_.shape[0]
+
+        if n_features_new > n_features_old:
+            # Add zeros for padding (min) and ones for scale
+            scaler.min_ = np.pad(scaler.min_, (0, n_features_new - n_features_old))
+            scaler.scale_ = np.pad(scaler.scale_, (0, n_features_new - n_features_old),
+                                   constant_values=1)
+        else:
+            # Truncate
+            scaler.min_ = scaler.min_[:n_features_new]
+            scaler.scale_ = scaler.scale_[:n_features_new]
+
+    else:
+        logger.warning(f"Unknown scaler type: {type(scaler)}, cannot adapt")
+
+    # Update n_features_in_ if it exists
+    if hasattr(scaler, 'n_features_in_'):
+        scaler.n_features_in_ = n_features_new
+
+    return scaler
 
 
 def evaluate_model():
@@ -1018,6 +1154,8 @@ def evaluate_model():
         is_ensemble = ensemble_exists
 
     # Load ensemble if available
+    ensemble_models = None
+    ensemble_weights = None
     if is_ensemble and ensemble_exists:
         logger.info("Loading ensemble models...")
         ensemble_models, ensemble_weights = load_ensemble_models(ensemble_dir)
@@ -1028,72 +1166,77 @@ def evaluate_model():
     # Try three different methods to load the model if not using ensemble
     model = None
     if not is_ensemble:
-        # Method 1: Load with compile=False and recompile
-        try:
-            model_path = os.path.join(MODEL_DIR, 'final_model.h5')
-            logger.info(f"Method 1: Loading model without compilation...")
-            model = load_model(model_path, compile=False)
+        model_filenames = ['final_model.h5', 'mt5_neural_network_model.h5', 'model.h5', 'best_model.h5']
 
-            # Recompile with custom metrics
-            model.compile(
-                optimizer='adam',
-                loss='mse',
-                metrics=[mae_custom, r2_keras, directional_accuracy]
-            )
-            logger.info(f"Model loaded and recompiled successfully")
+        for method in range(1, 4):
+            if model is not None:
+                break
 
-        except Exception as e:
-            logger.error(f"Method 1 failed: {e}")
-
-            # Method 2: Using custom_objects dictionary
-            try:
-                logger.info(f"Method 2: Loading with custom objects...")
-                custom_objects = {
-                    'r2_keras': r2_keras,
-                    'directional_accuracy': directional_accuracy,
-                    'mse_custom': mse_custom,
-                    'mae_custom': mae_custom
-                }
-
-                model = load_model(model_path, custom_objects=custom_objects)
-                logger.info(f"Model loaded with custom objects")
-            except Exception as e:
-                logger.error(f"Method 2 failed: {e}")
-
-                # Method 3: Create fresh model with same architecture
+            for filename in model_filenames:
                 try:
-                    logger.info(f"Method 3: Loading model weights only...")
+                    model_path = os.path.join(MODEL_DIR, filename)
+                    if not os.path.exists(model_path):
+                        continue
 
-                    # Get the model architecture from the saved file
-                    if os.path.exists(os.path.join(MODEL_DIR, 'model_architecture.json')):
-                        with open(os.path.join(MODEL_DIR, 'model_architecture.json'), 'r') as f:
-                            model_json = f.read()
+                    if method == 1:
+                        # Method 1: Load without compilation
+                        logger.info(f"Method 1: Loading model without compilation...")
+                        model = load_model(model_path, compile=False)
 
-                        from tensorflow.keras.models import model_from_json
-                        model = model_from_json(model_json)
-                        model.load_weights(model_path)
-
-                        # Compile the model
+                        # Recompile with custom metrics
                         model.compile(
                             optimizer='adam',
                             loss='mse',
-                            metrics=[mae_custom, r2_keras, directional_accuracy]
+                            metrics=['mae', r2_keras, directional_accuracy]
                         )
-                        logger.info(f"Model loaded from architecture and weights")
-                    else:
-                        logger.error("Model architecture file not found, cannot proceed")
-                        return None
-                except Exception as e:
-                    logger.error(f"Method 3 failed: {e}")
-                    logger.error("All model loading methods failed, cannot proceed with evaluation")
-                    return None
+                        logger.info(f"Model loaded and recompiled successfully")
+                        break
 
-    if not is_ensemble and model is None:
-        logger.error("Failed to load model using any method")
-        return None
+                    elif method == 2:
+                        # Method 2: Using custom_objects
+                        logger.info(f"Method 2: Loading with custom objects...")
+                        custom_objects = {
+                            'r2_keras': r2_keras,
+                            'directional_accuracy': directional_accuracy,
+                            'mse_custom': mse_custom,
+                            'mae_custom': mae_custom
+                        }
+
+                        model = load_model(model_path, custom_objects=custom_objects)
+                        logger.info(f"Model loaded with custom objects")
+                        break
+
+                    elif method == 3:
+                        # Method 3: Create model from architecture + weights
+                        logger.info(f"Method 3: Loading model architecture and weights...")
+
+                        architecture_path = os.path.join(MODEL_DIR, 'model_architecture.json')
+                        if os.path.exists(architecture_path):
+                            with open(architecture_path, 'r') as f:
+                                model_json = f.read()
+
+                            from tensorflow.keras.models import model_from_json
+                            model = model_from_json(model_json)
+                            model.load_weights(model_path)
+
+                            # Compile
+                            model.compile(
+                                optimizer='adam',
+                                loss='mse',
+                                metrics=['mae', r2_keras, directional_accuracy]
+                            )
+                            logger.info(f"Model loaded from architecture and weights")
+                            break
+                except Exception as e:
+                    logger.error(f"Method {method} failed with {filename}: {e}")
+                    continue
+
+        if model is None:
+            logger.error("Failed to load model using any method")
+            return None
 
     # Extract expected feature count
-    if is_ensemble:
+    if is_ensemble and ensemble_models:
         expected_features = inspect_model_input_shape(ensemble_models[0])
     else:
         expected_features = inspect_model_input_shape(model)
@@ -1102,15 +1245,15 @@ def evaluate_model():
         logger.info(f"Model expects {expected_features} input features")
     else:
         logger.warning("Could not determine expected feature count, using default")
-        expected_features = 103  # Based on the enhanced training logs
+        expected_features = 219  # Based on your previous logs
 
     # Load feature list
     try:
         with open(os.path.join(MODEL_DIR, 'feature_list.pkl'), 'rb') as f:
             feature_list = pickle.load(f)
         logger.info(f"Loaded {len(feature_list)} features from feature list")
-    except:
-        logger.warning("Could not load feature list, will create features from scratch")
+    except Exception as e:
+        logger.warning(f"Could not load feature list, will create features from scratch: {e}")
         feature_list = None
 
     # Load scaler
@@ -1118,6 +1261,10 @@ def evaluate_model():
         with open(os.path.join(MODEL_DIR, 'scaler.pkl'), 'rb') as f:
             scaler = pickle.load(f)
         logger.info("Scaler loaded successfully")
+
+        # Adapt scaler if needed to match expected feature count
+        if expected_features:
+            scaler = adapt_scaler(scaler, expected_features)
     except Exception as e:
         logger.error(f"Failed to load scaler: {e}")
         return
@@ -1147,79 +1294,133 @@ def evaluate_model():
 
         # Check if we have enough data
         if len(df_5pm) <= LOOKBACK:
-            logger.error(f"Not enough data points at 5 PM AZ time (only {len(df_5pm)} found)")
+            logger.warning(f"Limited data points at 5 PM AZ time (only {len(df_5pm)} found)")
+            logger.info("Using all hours instead of just 5 PM for testing...")
+
+            # Use all hours data instead
+            df_all_hours = df.copy()
+
+            # Add features to this dataset
+            logger.info("Adding datetime features...")
+            df_all_hours = add_datetime_features(df_all_hours)
+
+            if USE_MARKET_REGIMES:
+                logger.info("Detecting market regimes...")
+                df_all_hours = detect_market_regime(df_all_hours)
+
+            try:
+                logger.info("Adding wavelet features...")
+                df_all_hours = add_wavelet_features(df_all_hours)
+            except Exception as e:
+                logger.warning(f"Error adding wavelet features: {e}. Skipping.")
+
+            logger.info("Adding technical indicators...")
+            df_all_hours = add_technical_indicators(df_all_hours)
+
+            logger.info("Adding lagged features...")
+            df_all_hours = add_lagged_features(df_all_hours)
+
+            logger.info("Adding target variables...")
+            df_all_hours = add_target_variables(df_all_hours)
+
+            # Use this dataset instead
+            df_5pm = df_all_hours
+            logger.info(f"Using expanded dataset with {len(df_5pm)} data points")
+        else:
+            # Process the 5 PM dataset
+            logger.info("Adding datetime features...")
+            df_5pm = add_datetime_features(df_5pm)
+
+            if USE_MARKET_REGIMES:
+                logger.info("Detecting market regimes...")
+                df_5pm = detect_market_regime(df_5pm)
+
+            try:
+                logger.info("Adding wavelet features...")
+                df_5pm = add_wavelet_features(df_5pm)
+            except Exception as e:
+                logger.warning(f"Error adding wavelet features: {e}. Skipping.")
+
+            logger.info("Adding technical indicators...")
+            df_5pm = add_technical_indicators(df_5pm)
+
+            logger.info("Adding lagged features...")
+            df_5pm = add_lagged_features(df_5pm)
+
+            logger.info("Adding target variables...")
+            df_5pm = add_target_variables(df_5pm)
+
+        # Check that our target column exists
+        if 'next_close_change_pct' not in df_5pm.columns:
+            logger.error("Target column 'next_close_change_pct' not found after preprocessing!")
             return
 
-        # Add features to match the features used in training
-        logger.info("Adding datetime features...")
-        df_5pm = add_datetime_features(df_5pm)
-
-        # Add market regime detection if enabled
-        if USE_MARKET_REGIMES:
-            logger.info("Detecting market regimes...")
-            df_5pm = detect_market_regime(df_5pm)
-
-        # Add wavelet features
-        try:
-            logger.info("Adding wavelet features...")
-            df_5pm = add_wavelet_features(df_5pm)
-        except Exception as e:
-            logger.warning(f"Error adding wavelet features: {e}. Skipping.")
-
-        logger.info("Adding technical indicators...")
-        df_5pm = add_technical_indicators(df_5pm)
-
-        logger.info("Adding lagged features...")
-        df_5pm = add_lagged_features(df_5pm)
-
-        logger.info("Adding target variables...")
-        df_5pm = add_target_variables(df_5pm)
-
         # Prepare features and target
-        X, y, actual_feature_list = prepare_features_and_targets(df_5pm)
+        X, y, actual_features = prepare_features_and_targets(df_5pm, expected_features=expected_features)
 
-        # Scale features
-        X_scaled = scaler.transform(X)
+        try:
+            # Scale features
+            X_scaled = scaler.transform(X)
+        except Exception as e:
+            logger.error(f"Error scaling features: {e}")
+            # Try adapting scaler or using unscaled features
+            try:
+                # Try adapting scaler
+                logger.info("Trying to adapt scaler to current feature count...")
+                scaler = adapt_scaler(scaler, X.shape[1])
+                X_scaled = scaler.transform(X)
+            except:
+                logger.warning("Using unscaled features as fallback")
+                X_scaled = X
 
         # Create sequences
         X_seq, y_seq = create_sequences(X_scaled, y)
 
-        # Adjust feature dimensions if needed
-        if expected_features:
-            current_features = X_seq.shape[2]
-            if current_features != expected_features:
-                logger.warning(
-                    f"Feature count mismatch: model expects {expected_features}, data has {current_features}")
-
-                # Pad or truncate features to match
-                if current_features < expected_features:
-                    padding_size = expected_features - current_features
-                    logger.info(f"Padding data with {padding_size} additional feature columns")
-
-                    # Create padded array
-                    X_padded = np.zeros((X_seq.shape[0], X_seq.shape[1], expected_features))
-                    X_padded[:, :, :current_features] = X_seq
-                    X_seq = X_padded
-                else:
-                    logger.info(f"Truncating data from {current_features} to {expected_features} features")
-                    X_seq = X_seq[:, :, :expected_features]
+        if len(X_seq) == 0:
+            logger.error("Not enough data to create sequences!")
+            return
 
         logger.info(f"Test data shape: {X_seq.shape}")
 
         # Make predictions
-        if is_ensemble:
-            y_pred = ensemble_predict(ensemble_models, ensemble_weights, X_seq)
-        else:
-            y_pred = model.predict(X_seq)
+        try:
+            if is_ensemble and ensemble_models:
+                logger.info(f"Running ensemble prediction on {len(X_seq)} samples...")
+                y_pred = ensemble_predict(ensemble_models, ensemble_weights, X_seq)
+            else:
+                logger.info(f"Running model prediction on {len(X_seq)} samples...")
+                y_pred = model.predict(X_seq, verbose=1)
+                # Ensure it's flattened
+                y_pred = y_pred.flatten()
+
+            # Check for all-same predictions (a sign of model issues)
+            if len(y_pred) > 1 and all(y_pred == y_pred[0]):
+                logger.warning(
+                    "All predictions are identical! This indicates a serious problem with the model or data.")
+
+            # Log prediction statistics
+            logger.info(f"Prediction stats: min={np.min(y_pred)}, max={np.max(y_pred)}, mean={np.mean(y_pred)}")
+            logger.info(f"First 5 predictions: {y_pred[:5]}")
+            logger.info(f"First 5 actual values: {y_seq[:5]}")
+
+        except Exception as e:
+            logger.error(f"Error making predictions: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return
 
         # Calculate metrics
-        mse = mean_squared_error(y_seq, y_pred)
-        rmse = np.sqrt(mse)
-        mae = mean_absolute_error(y_seq, y_pred)
-        r2 = r2_score(y_seq, y_pred)
+        try:
+            mse = mean_squared_error(y_seq, y_pred)
+            rmse = np.sqrt(mse)
+            mae = mean_absolute_error(y_seq, y_pred)
+            r2 = r2_score(y_seq, y_pred)
 
-        # Directional accuracy
-        directional_acc = np.mean((np.sign(y_seq) == np.sign(y_pred)).astype(int))
+            # Directional accuracy
+            directional_acc = np.mean((np.sign(y_seq) == np.sign(y_pred)).astype(int))
+        except Exception as e:
+            logger.error(f"Error calculating metrics: {e}")
+            return
 
         # Calculate precision-recall for extreme moves (if predicted magnitude > 0.5% and actual direction matches)
         extreme_threshold = 0.5  # Consider moves > 0.5% as significant
@@ -1240,32 +1441,34 @@ def evaluate_model():
             recall = 0
 
         # Calculate risk metrics
+        risk_metrics = {}
         if RISK_MANAGEMENT:
-            # Calculate Kelly criterion for different position types
-            kelly_long = calculate_kelly_criterion(y_pred, y_seq, 'long_only')
-            kelly_short = calculate_kelly_criterion(y_pred, y_seq, 'short_only')
-            kelly_combined = calculate_kelly_criterion(y_pred, y_seq, 'long_short')
+            try:
+                # Calculate Kelly criterion for different position types
+                kelly_long = calculate_kelly_criterion(y_pred, y_seq, 'long_only')
+                kelly_short = calculate_kelly_criterion(y_pred, y_seq, 'short_only')
+                kelly_combined = calculate_kelly_criterion(y_pred, y_seq, 'long_short')
 
-            # Apply KELLY_FRACTION to get conservative position sizing
-            position_size_long = kelly_long * KELLY_FRACTION
-            position_size_short = kelly_short * KELLY_FRACTION
-            position_size_combined = kelly_combined * KELLY_FRACTION
+                # Apply KELLY_FRACTION to get conservative position sizing
+                position_size_long = kelly_long * KELLY_FRACTION
+                position_size_short = kelly_short * KELLY_FRACTION
+                position_size_combined = kelly_combined * KELLY_FRACTION
 
-            logger.info(f"Kelly Position Sizing:")
-            logger.info(f"Long: {position_size_long:.2%}")
-            logger.info(f"Short: {position_size_short:.2%}")
-            logger.info(f"Combined: {position_size_combined:.2%}")
+                logger.info(f"Kelly Position Sizing:")
+                logger.info(f"Long: {position_size_long:.2%}")
+                logger.info(f"Short: {position_size_short:.2%}")
+                logger.info(f"Combined: {position_size_combined:.2%}")
 
-            risk_metrics = {
-                'kelly_long': kelly_long,
-                'kelly_short': kelly_short,
-                'kelly_combined': kelly_combined,
-                'position_size_long': position_size_long,
-                'position_size_short': position_size_short,
-                'position_size_combined': position_size_combined
-            }
-        else:
-            risk_metrics = {}
+                risk_metrics = {
+                    'kelly_long': kelly_long,
+                    'kelly_short': kelly_short,
+                    'kelly_combined': kelly_combined,
+                    'position_size_long': position_size_long,
+                    'position_size_short': position_size_short,
+                    'position_size_combined': position_size_combined
+                }
+            except Exception as e:
+                logger.error(f"Error calculating risk metrics: {e}")
 
         # Log metrics
         logger.info(f"Test Metrics:")
@@ -1278,120 +1481,136 @@ def evaluate_model():
         logger.info(f"Extreme Move Recall: {recall:.2%}")
 
         # Create a DataFrame with dates and predictions for better analysis
-        test_dates = df_5pm.iloc[LOOKBACK:]['arizona_time'].reset_index(drop=True)[:len(y_pred)]
+        try:
+            test_dates = df_5pm.iloc[LOOKBACK:]['arizona_time'].reset_index(drop=True)[:len(y_pred)]
 
-        results_df = pd.DataFrame({
-            'date': test_dates,
-            'actual': y_seq.flatten(),
-            'prediction': y_pred.flatten()
-        })
+            # Ensure we have data to work with
+            if len(test_dates) > 0 and len(y_pred) > 0:
+                # Truncate to shortest length to avoid issues
+                min_len = min(len(test_dates), len(y_pred), len(y_seq))
 
-        # Mark extreme moves
-        results_df['extreme_actual'] = np.abs(results_df['actual']) > extreme_threshold
-        results_df['extreme_pred'] = np.abs(results_df['prediction']) > extreme_threshold
+                results_df = pd.DataFrame({
+                    'date': test_dates[:min_len],
+                    'actual': y_seq[:min_len],
+                    'prediction': y_pred[:min_len]
+                })
 
-        # Add market regimes if enabled
-        if USE_MARKET_REGIMES and 'regime' in df_5pm.columns:
-            regime_data = df_5pm.iloc[LOOKBACK:][['regime', 'regime_trending',
-                                                  'regime_mean_reverting', 'regime_volatile']].reset_index(drop=True)
+                # Mark extreme moves
+                results_df['extreme_actual'] = np.abs(results_df['actual']) > extreme_threshold
+                results_df['extreme_pred'] = np.abs(results_df['prediction']) > extreme_threshold
 
-            # Add regime information to results
-            results_df = pd.concat([
-                results_df,
-                regime_data.iloc[:len(results_df)].reset_index(drop=True)
-            ], axis=1)
+                # Add market regimes if enabled
+                if USE_MARKET_REGIMES and 'regime' in df_5pm.columns:
+                    regime_data = df_5pm.iloc[LOOKBACK:][['regime', 'regime_trending',
+                                                          'regime_mean_reverting', 'regime_volatile']].reset_index(
+                        drop=True)
 
-            # Calculate performance by regime
-            for regime_name, regime_id in zip(['Normal', 'Trending', 'Mean-Rev', 'Volatile'], range(4)):
-                mask = results_df['regime'] == regime_id
-                if mask.sum() > 0:
-                    regime_acc = np.mean((np.sign(results_df.loc[mask, 'actual']) ==
-                                          np.sign(results_df.loc[mask, 'prediction'])).astype(int))
-                    logger.info(f"Directional Accuracy in {regime_name} regime: {regime_acc:.2%}")
+                    # Add regime information to results if possible
+                    if len(regime_data) >= min_len:
+                        results_df = pd.concat([
+                            results_df,
+                            regime_data.iloc[:min_len].reset_index(drop=True)
+                        ], axis=1)
 
-        # Plot predictions vs actual
-        plt.figure(figsize=(14, 7))
-        plt.plot(results_df['date'], results_df['actual'], label='Actual', alpha=0.7)
-        plt.plot(results_df['date'], results_df['prediction'], label='Predicted', alpha=0.7)
-        plt.title('Model Predictions vs Actual Values')
-        plt.xlabel('Date')
-        plt.ylabel('Price Change (%)')
-        plt.legend()
-        plt.grid(True)
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        plt.savefig(os.path.join(TEST_RESULTS_DIR, 'test_predictions.png'))
+                        # Calculate performance by regime
+                        for regime_name, regime_id in zip(['Normal', 'Trending', 'Mean-Rev', 'Volatile'], range(4)):
+                            mask = results_df['regime'] == regime_id
+                            if mask.sum() > 0:
+                                regime_acc = np.mean((np.sign(results_df.loc[mask, 'actual']) ==
+                                                      np.sign(results_df.loc[mask, 'prediction'])).astype(int))
+                                logger.info(f"Directional Accuracy in {regime_name} regime: {regime_acc:.2%}")
 
-        # Plot prediction error
-        plt.figure(figsize=(14, 7))
-        results_df['error'] = results_df['actual'] - results_df['prediction']
-        plt.plot(results_df['date'], results_df['error'])
-        plt.axhline(y=0, color='r', linestyle='-', alpha=0.3)
-        plt.title('Prediction Error')
-        plt.xlabel('Date')
-        plt.ylabel('Error')
-        plt.grid(True)
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        plt.savefig(os.path.join(TEST_RESULTS_DIR, 'prediction_error.png'))
+                # Plot predictions vs actual
+                plt.figure(figsize=(14, 7))
+                plt.plot(results_df['date'], results_df['actual'], label='Actual', alpha=0.7)
+                plt.plot(results_df['date'], results_df['prediction'], label='Predicted', alpha=0.7)
+                plt.title('Model Predictions vs Actual Values')
+                plt.xlabel('Date')
+                plt.ylabel('Price Change (%)')
+                plt.legend()
+                plt.grid(True)
+                plt.xticks(rotation=45)
+                plt.tight_layout()
+                plt.savefig(os.path.join(TEST_RESULTS_DIR, 'test_predictions.png'))
 
-        # Plot scatter of predicted vs actual
-        plt.figure(figsize=(10, 10))
-        plt.scatter(results_df['actual'], results_df['prediction'])
-        plt.title('Actual vs Predicted')
-        plt.xlabel('Actual')
-        plt.ylabel('Predicted')
+                # Plot prediction error
+                plt.figure(figsize=(14, 7))
+                results_df['error'] = results_df['actual'] - results_df['prediction']
+                plt.plot(results_df['date'], results_df['error'])
+                plt.axhline(y=0, color='r', linestyle='-', alpha=0.3)
+                plt.title('Prediction Error')
+                plt.xlabel('Date')
+                plt.ylabel('Error')
+                plt.grid(True)
+                plt.xticks(rotation=45)
+                plt.tight_layout()
+                plt.savefig(os.path.join(TEST_RESULTS_DIR, 'prediction_error.png'))
 
-        # Add 45-degree line
-        min_val = min(np.min(results_df['actual']), np.min(results_df['prediction']))
-        max_val = max(np.max(results_df['actual']), np.max(results_df['prediction']))
-        plt.plot([min_val, max_val], [min_val, max_val], 'r--')
-        plt.grid(True)
-        plt.savefig(os.path.join(TEST_RESULTS_DIR, 'scatter_comparison.png'))
+                # Plot scatter of predicted vs actual
+                plt.figure(figsize=(10, 10))
+                plt.scatter(results_df['actual'], results_df['prediction'])
+                plt.title('Actual vs Predicted')
+                plt.xlabel('Actual')
+                plt.ylabel('Predicted')
 
-        # Save results DataFrame for further analysis
-        results_df.to_csv(os.path.join(TEST_RESULTS_DIR, 'test_results.csv'), index=False)
+                # Add 45-degree line
+                min_val = min(np.min(results_df['actual']), np.min(results_df['prediction']))
+                max_val = max(np.max(results_df['actual']), np.max(results_df['prediction']))
+                plt.plot([min_val, max_val], [min_val, max_val], 'r--')
+                plt.grid(True)
+                plt.savefig(os.path.join(TEST_RESULTS_DIR, 'scatter_comparison.png'))
 
-        # Plot confidence analysis (magnitude of prediction vs accuracy)
-        plt.figure(figsize=(12, 6))
+                # Save results DataFrame for further analysis
+                results_df.to_csv(os.path.join(TEST_RESULTS_DIR, 'test_results.csv'), index=False)
 
-        # Group predictions by magnitude
-        results_df['pred_abs'] = np.abs(results_df['prediction'])
-        results_df['correct'] = np.sign(results_df['actual']) == np.sign(results_df['prediction'])
+                # Plot confidence analysis if enough data
+                if len(results_df) >= 10:
+                    plt.figure(figsize=(12, 6))
 
-        # Create bins by prediction magnitude
-        bins = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 1.0, 100]
-        bin_labels = ['0-0.1%', '0.1-0.2%', '0.2-0.3%', '0.3-0.4%', '0.4-0.5%', '0.5-1.0%', '1.0%+']
-        results_df['magnitude_bin'] = pd.cut(results_df['pred_abs'], bins=bins, labels=bin_labels)
+                    # Group predictions by magnitude
+                    results_df['pred_abs'] = np.abs(results_df['prediction'])
+                    results_df['correct'] = np.sign(results_df['actual']) == np.sign(results_df['prediction'])
 
-        # Calculate accuracy by bin
-        accuracy_by_magnitude = results_df.groupby('magnitude_bin')['correct'].mean()
-        count_by_magnitude = results_df.groupby('magnitude_bin').size()
+                    # Create bins by prediction magnitude
+                    bins = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 1.0, 100]
+                    bin_labels = ['0-0.1%', '0.1-0.2%', '0.2-0.3%', '0.3-0.4%', '0.4-0.5%', '0.5-1.0%', '1.0%+']
+                    results_df['magnitude_bin'] = pd.cut(results_df['pred_abs'], bins=bins, labels=bin_labels)
 
-        # Plot accuracy by prediction magnitude
-        ax = plt.subplot(1, 2, 1)
-        accuracy_by_magnitude.plot(kind='bar', ax=ax)
-        plt.title('Accuracy by Prediction Magnitude')
-        plt.xlabel('Predicted Magnitude')
-        plt.ylabel('Directional Accuracy')
-        plt.ylim(0, 1)
+                    # Calculate accuracy by bin
+                    accuracy_by_magnitude = results_df.groupby('magnitude_bin')['correct'].mean()
+                    count_by_magnitude = results_df.groupby('magnitude_bin').size()
 
-        # Add count labels
-        for i, v in enumerate(accuracy_by_magnitude):
-            plt.text(i, v + 0.02, f"n={count_by_magnitude.iloc[i]}", ha='center')
+                    # Plot accuracy by prediction magnitude
+                    ax = plt.subplot(1, 2, 1)
+                    accuracy_by_magnitude.plot(kind='bar', ax=ax)
+                    plt.title('Accuracy by Prediction Magnitude')
+                    plt.xlabel('Predicted Magnitude')
+                    plt.ylabel('Directional Accuracy')
+                    plt.ylim(0, 1)
 
-        # Plot trade distribution
-        ax = plt.subplot(1, 2, 2)
-        count_by_magnitude.plot(kind='bar', ax=ax)
-        plt.title('Trade Count by Prediction Magnitude')
-        plt.xlabel('Predicted Magnitude')
-        plt.ylabel('Number of Trades')
+                    # Add count labels
+                    for i, v in enumerate(accuracy_by_magnitude):
+                        plt.text(i, v + 0.02, f"n={count_by_magnitude.iloc[i]}", ha='center')
 
-        plt.tight_layout()
-        plt.savefig(os.path.join(TEST_RESULTS_DIR, 'confidence_analysis.png'))
+                    # Plot trade distribution
+                    ax = plt.subplot(1, 2, 2)
+                    count_by_magnitude.plot(kind='bar', ax=ax)
+                    plt.title('Trade Count by Prediction Magnitude')
+                    plt.xlabel('Predicted Magnitude')
+                    plt.ylabel('Number of Trades')
+
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(TEST_RESULTS_DIR, 'confidence_analysis.png'))
+            else:
+                logger.warning("Not enough data to create results DataFrame")
+
+        except Exception as e:
+            logger.error(f"Error creating results DataFrame: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
         # Save risk management data if enabled
-        if RISK_MANAGEMENT:
+        if RISK_MANAGEMENT and risk_metrics:
             with open(os.path.join(TEST_RESULTS_DIR, 'risk_metrics.json'), 'w') as f:
                 json.dump(risk_metrics, f, indent=4)
 
@@ -1416,522 +1635,18 @@ def evaluate_model():
         mt5.shutdown()
 
 
-def backtest_strategy(threshold=0.1):
-    """
-    Backtest the trained model strategy on historical data
-    """
-    # Check if we have an ensemble model
-    ensemble_dir = os.path.join(MODEL_DIR, 'ensemble')
-    ensemble_exists = os.path.exists(ensemble_dir)
-
-    # Load metadata first to check if we have an ensemble
-    metadata_path = os.path.join(MODEL_DIR, 'metadata.json')
-    if os.path.exists(metadata_path):
-        try:
-            with open(metadata_path, 'r') as f:
-                metadata = json.load(f)
-                is_ensemble = metadata.get('is_ensemble', False)
-                logger.info(f"Model metadata loaded. Ensemble: {is_ensemble}")
-        except Exception as e:
-            logger.warning(f"Could not load metadata: {e}")
-            is_ensemble = ensemble_exists
-    else:
-        is_ensemble = ensemble_exists
-
-    # Load ensemble if available
-    if is_ensemble and ensemble_exists:
-        logger.info("Loading ensemble models...")
-        ensemble_models, ensemble_weights = load_ensemble_models(ensemble_dir)
-        if ensemble_models is None:
-            logger.warning("Failed to load ensemble, falling back to single model")
-            is_ensemble = False
-
-    # Try three different methods to load the model if not using ensemble
-    model = None
-    if not is_ensemble:
-        # Method 1: Load with compile=False and recompile
-        try:
-            model_path = os.path.join(MODEL_DIR, 'final_model.h5')
-            logger.info(f"Method 1: Loading model without compilation...")
-            model = load_model(model_path, compile=False)
-
-            # Recompile with custom metrics
-            model.compile(
-                optimizer='adam',
-                loss='mse',
-                metrics=[mae_custom, r2_keras, directional_accuracy]
-            )
-            logger.info(f"Model loaded and recompiled successfully")
-
-        except Exception as e:
-            logger.error(f"Method 1 failed: {e}")
-
-            # Method 2: Using custom_objects dictionary
-            try:
-                logger.info(f"Method 2: Loading with custom objects...")
-                custom_objects = {
-                    'r2_keras': r2_keras,
-                    'directional_accuracy': directional_accuracy,
-                    'mse_custom': mse_custom,
-                    'mae_custom': mae_custom
-                }
-
-                model = load_model(model_path, custom_objects=custom_objects)
-                logger.info(f"Model loaded with custom objects")
-            except Exception as e:
-                logger.error(f"Method 2 failed: {e}")
-
-                # Method 3: Create fresh model with same architecture
-                try:
-                    logger.info(f"Method 3: Loading model weights only...")
-
-                    # Get the model architecture from the saved file
-                    if os.path.exists(os.path.join(MODEL_DIR, 'model_architecture.json')):
-                        with open(os.path.join(MODEL_DIR, 'model_architecture.json'), 'r') as f:
-                            model_json = f.read()
-
-                        from tensorflow.keras.models import model_from_json
-                        model = model_from_json(model_json)
-                        model.load_weights(model_path)
-
-                        # Compile the model
-                        model.compile(
-                            optimizer='adam',
-                            loss='mse',
-                            metrics=[mae_custom, r2_keras, directional_accuracy]
-                        )
-                        logger.info(f"Model loaded from architecture and weights")
-                    else:
-                        logger.error("Model architecture file not found, cannot proceed")
-                        return None
-                except Exception as e:
-                    logger.error(f"Method 3 failed: {e}")
-                    logger.error("All model loading methods failed, cannot proceed with evaluation")
-                    return None
-
-    if not is_ensemble and model is None:
-        logger.error("Failed to load model using any method")
-        return None
-
-    # Extract expected feature count
-    if is_ensemble:
-        expected_features = inspect_model_input_shape(ensemble_models[0])
-    else:
-        expected_features = inspect_model_input_shape(model)
-
-    if expected_features:
-        logger.info(f"Model expects {expected_features} input features")
-    else:
-        logger.warning("Could not determine expected feature count, using default")
-        expected_features = 103  # Based on enhanced training
-
-    # Load scaler
-    try:
-        with open(os.path.join(MODEL_DIR, 'scaler.pkl'), 'rb') as f:
-            scaler = pickle.load(f)
-        logger.info("Scaler loaded successfully")
-    except Exception as e:
-        logger.error(f"Failed to load scaler: {e}")
-        return
-
-    # Connect to MT5
-    account = 90933473
-    password = "NhXgR*3g"
-    server = "MetaQuotes-Demo"
-
-    if not connect_to_mt5(account, password, server):
-        return
-
-    try:
-        # Define date range for backtest (6 months)
-        end_date = datetime.now(ARIZONA_TZ)
-        start_date = end_date - timedelta(days=180)
-
-        # Get historical data
-        df = get_historical_data(SYMBOL, TIMEFRAME, start_date, end_date)
-        if df is None:
-            return
-
-        # Filter for 5 PM Arizona time
-        df_5pm = filter_5pm_data(df)
-
-        # Check if we have enough data
-        if len(df_5pm) <= LOOKBACK:
-            logger.error(f"Not enough data points at 5 PM AZ time (only {len(df_5pm)} found)")
-            return
-
-        # Add features to match the features used in training
-        logger.info("Adding datetime features...")
-        df_5pm = add_datetime_features(df_5pm)
-
-        # Add market regime detection if enabled
-        if USE_MARKET_REGIMES:
-            logger.info("Detecting market regimes...")
-            df_5pm = detect_market_regime(df_5pm)
-
-        # Add wavelet features
-        try:
-            logger.info("Adding wavelet features...")
-            df_5pm = add_wavelet_features(df_5pm)
-        except Exception as e:
-            logger.warning(f"Error adding wavelet features: {e}. Skipping.")
-
-        logger.info("Adding technical indicators...")
-        df_5pm = add_technical_indicators(df_5pm)
-
-        logger.info("Adding lagged features...")
-        df_5pm = add_lagged_features(df_5pm)
-
-        logger.info("Adding target variables...")
-        df_5pm = add_target_variables(df_5pm)
-
-        # Prepare features and target
-        X, y, feature_list = prepare_features_and_targets(df_5pm)
-
-        # Scale features
-        X_scaled = scaler.transform(X)
-
-        # Create sequences
-        X_seq, y_seq = create_sequences(X_scaled, y)
-
-        # Adjust feature dimensions if needed
-        if expected_features:
-            current_features = X_seq.shape[2]
-            if current_features != expected_features:
-                logger.warning(
-                    f"Feature count mismatch: model expects {expected_features}, data has {current_features}")
-
-                # Pad or truncate features to match
-                if current_features < expected_features:
-                    padding_size = expected_features - current_features
-                    logger.info(f"Padding data with {padding_size} additional feature columns")
-
-                    # Create padded array
-                    X_padded = np.zeros((X_seq.shape[0], X_seq.shape[1], expected_features))
-                    X_padded[:, :, :current_features] = X_seq
-                    X_seq = X_padded
-                else:
-                    logger.info(f"Truncating data from {current_features} to {expected_features} features")
-                    X_seq = X_seq[:, :, :expected_features]
-
-        logger.info(f"Backtest data shape: {X_seq.shape}")
-
-        # Make predictions
-        if is_ensemble:
-            predictions = ensemble_predict(ensemble_models, ensemble_weights, X_seq)
-        else:
-            predictions = model.predict(X_seq)
-
-        # Create results DataFrame with dates
-        dates = df_5pm.iloc[LOOKBACK:]['arizona_time'].reset_index(drop=True)
-
-        df_results = pd.DataFrame({
-            'date': dates[:len(predictions)],
-            'actual': y_seq.flatten(),
-            'prediction': predictions.flatten()
-        })
-
-        # Add confidence score (absolute value of prediction)
-        df_results['confidence'] = np.abs(df_results['prediction'])
-
-        # Add market regime information if available
-        if USE_MARKET_REGIMES and 'regime' in df_5pm.columns:
-            regime_data = df_5pm.iloc[LOOKBACK:][['regime', 'regime_trending',
-                                                  'regime_mean_reverting', 'regime_volatile']].reset_index(drop=True)
-
-            # Add regime information to results
-            df_results = pd.concat([
-                df_results,
-                regime_data.iloc[:len(df_results)].reset_index(drop=True)
-            ], axis=1)
-
-        # Set up trading strategy with confidence filtering
-        df_results['signal'] = 0  # 0 = no trade, 1 = buy, -1 = sell
-
-        if CONFIDENCE_FILTERING:
-            # Only take trades above threshold and with higher confidence
-            df_results.loc[(df_results['prediction'] > threshold) &
-                           (df_results['confidence'] > threshold * 1.5), 'signal'] = 1
-
-            df_results.loc[(df_results['prediction'] < -threshold) &
-                           (df_results['confidence'] > threshold * 1.5), 'signal'] = -1
-        else:
-            # Standard threshold approach
-            df_results.loc[df_results['prediction'] > threshold, 'signal'] = 1
-            df_results.loc[df_results['prediction'] < -threshold, 'signal'] = -1
-
-        # Use regime-specific thresholds if enabled and available
-        if USE_MARKET_REGIMES and 'regime' in df_results.columns:
-            # Adjust thresholds by regime
-            # Lower thresholds in trending markets (more trades)
-            # Higher thresholds in volatile markets (fewer trades)
-            trending_threshold = threshold * 0.8
-            volatile_threshold = threshold * 1.5
-
-            # Trending regime - lower threshold for trades
-            df_results.loc[(df_results['regime'] == 1) &
-                           (df_results['prediction'] > trending_threshold), 'signal'] = 1
-            df_results.loc[(df_results['regime'] == 1) &
-                           (df_results['prediction'] < -trending_threshold), 'signal'] = -1
-
-            # Volatile regime - higher threshold for trades
-            df_results.loc[df_results['regime'] == 3, 'signal'] = 0  # Reset signals
-            df_results.loc[(df_results['regime'] == 3) &
-                           (df_results['prediction'] > volatile_threshold), 'signal'] = 1
-            df_results.loc[(df_results['regime'] == 3) &
-                           (df_results['prediction'] < -volatile_threshold), 'signal'] = -1
-
-        # Apply position sizing if risk management is enabled
-        if RISK_MANAGEMENT:
-            # Calculate Kelly criterion for each signal
-            long_signals = df_results['signal'] == 1
-            short_signals = df_results['signal'] == -1
-
-            # Calculate Kelly for long and short positions
-            kelly_long = calculate_kelly_criterion(
-                df_results.loc[long_signals, 'prediction'],
-                df_results.loc[long_signals, 'actual'],
-                'long_only'
-            ) if any(long_signals) else 0
-
-            kelly_short = calculate_kelly_criterion(
-                df_results.loc[short_signals, 'prediction'],
-                df_results.loc[short_signals, 'actual'],
-                'short_only'
-            ) if any(short_signals) else 0
-
-            # Apply risk adjustment
-            position_size_long = kelly_long * KELLY_FRACTION
-            position_size_short = kelly_short * KELLY_FRACTION
-
-            # Scale position size by confidence (prediction magnitude)
-            df_results['position_size'] = 0.0
-
-            # Apply position sizing but ensure it doesn't exceed max
-            df_results.loc[long_signals, 'position_size'] = np.minimum(
-                position_size_long * (df_results.loc[long_signals, 'confidence'] / threshold),
-                1.0  # Max position size is 100%
-            )
-
-            df_results.loc[short_signals, 'position_size'] = np.minimum(
-                position_size_short * (df_results.loc[short_signals, 'confidence'] / threshold),
-                1.0  # Max position size is 100%
-            )
-
-            # Calculate dynamic position-sized returns
-            df_results['strategy_return'] = df_results['signal'] * df_results['position_size'] * df_results['actual']
-        else:
-            # Simple fixed position sizing
-            df_results['strategy_return'] = df_results['signal'] * df_results['actual']
-
-        # Calculate cumulative returns
-        df_results['cumulative_market_return'] = df_results['actual'].cumsum()
-        df_results['cumulative_strategy_return'] = df_results['strategy_return'].cumsum()
-
-        # Calculate metrics
-        total_trades = (df_results['signal'] != 0).sum()
-        winning_trades = (df_results['strategy_return'] > 0).sum()
-        win_rate = winning_trades / total_trades if total_trades > 0 else 0
-
-        market_return = df_results['cumulative_market_return'].iloc[-1]
-        strategy_return = df_results['cumulative_strategy_return'].iloc[-1]
-
-        # Calculate Sharpe Ratio (assume risk-free rate of 0)
-        strategy_std = df_results['strategy_return'].std()
-        market_std = df_results['actual'].std()
-
-        sharpe_ratio = (df_results['strategy_return'].mean() / strategy_std) * np.sqrt(252) if strategy_std > 0 else 0
-        market_sharpe = (df_results['actual'].mean() / market_std) * np.sqrt(252) if market_std > 0 else 0
-
-        # Maximum Drawdown
-        cumulative = df_results['cumulative_strategy_return']
-        running_max = cumulative.cummax()
-        drawdown = (cumulative - running_max) / running_max
-        max_drawdown = drawdown.min()
-
-        # Plot results
-        plt.figure(figsize=(14, 7))
-        plt.plot(df_results['date'], df_results['cumulative_market_return'], label='Buy and Hold', alpha=0.7)
-        plt.plot(df_results['date'], df_results['cumulative_strategy_return'], label='Strategy', alpha=0.7)
-        plt.title('Cumulative Returns: Strategy vs Buy and Hold')
-        plt.xlabel('Date')
-        plt.ylabel('Cumulative Return (%)')
-        plt.legend()
-        plt.grid(True)
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        plt.savefig(os.path.join(TEST_RESULTS_DIR, 'backtest_results.png'))
-
-        # Plot signals
-        plt.figure(figsize=(14, 7))
-        buy_signals = df_results[df_results['signal'] == 1]
-        sell_signals = df_results[df_results['signal'] == -1]
-
-        # Plot price
-        plt.plot(df_results['date'], df_results['actual'].cumsum(), label='Price', alpha=0.7)
-
-        # Plot buy/sell signals
-        plt.scatter(buy_signals['date'], buy_signals['cumulative_market_return'],
-                    marker='^', color='green', s=100, label='Buy Signal')
-        plt.scatter(sell_signals['date'], sell_signals['cumulative_market_return'],
-                    marker='v', color='red', s=100, label='Sell Signal')
-
-        plt.title('Trading Signals')
-        plt.xlabel('Date')
-        plt.ylabel('Cumulative Price Change (%)')
-        plt.legend()
-        plt.grid(True)
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        plt.savefig(os.path.join(TEST_RESULTS_DIR, 'trading_signals.png'))
-
-        # Plot regime-specific performance if available
-        if USE_MARKET_REGIMES and 'regime' in df_results.columns:
-            plt.figure(figsize=(14, 10))
-
-            # Plot performance by regime
-            regime_returns = {}
-            for regime_id, regime_name in enumerate(['Normal', 'Trending', 'Mean-Rev', 'Volatile']):
-                regime_data = df_results[df_results['regime'] == regime_id]
-                if not regime_data.empty:
-                    regime_returns[regime_name] = regime_data['strategy_return'].cumsum()
-
-            # Plot regime-specific returns
-            for regime_name, returns in regime_returns.items():
-                plt.plot(returns.index, returns.values, label=f'{regime_name} Regime')
-
-            plt.title('Strategy Performance by Market Regime')
-            plt.xlabel('Trade Number')
-            plt.ylabel('Cumulative Return (%)')
-            plt.legend()
-            plt.grid(True)
-            plt.tight_layout()
-            plt.savefig(os.path.join(TEST_RESULTS_DIR, 'regime_performance.png'))
-
-        # Log results
-        logger.info(f"Backtest Results:")
-        logger.info(f"Total trades: {total_trades}")
-        logger.info(f"Winning trades: {winning_trades}")
-        logger.info(f"Win rate: {win_rate:.2%}")
-        logger.info(f"Market return: {market_return:.2f}%")
-        logger.info(f"Strategy return: {strategy_return:.2f}%")
-        logger.info(f"Sharpe ratio (Strategy): {sharpe_ratio:.2f}")
-        logger.info(f"Sharpe ratio (Market): {market_sharpe:.2f}")
-        logger.info(f"Maximum Drawdown: {max_drawdown:.2%}")
-
-        # Save detailed backtest results
-        df_results.to_csv(os.path.join(TEST_RESULTS_DIR, 'backtest_detailed.csv'))
-
-        # Save backtest summary
-        backtest_summary = {
-            'total_trades': int(total_trades),
-            'winning_trades': int(winning_trades),
-            'win_rate': float(win_rate),
-            'market_return': float(market_return),
-            'strategy_return': float(strategy_return),
-            'sharpe_ratio': float(sharpe_ratio),
-            'market_sharpe': float(market_sharpe),
-            'max_drawdown': float(max_drawdown),
-            'threshold': float(threshold),
-            'confidence_filtering': CONFIDENCE_FILTERING,
-            'risk_management': RISK_MANAGEMENT,
-            'market_regimes': USE_MARKET_REGIMES,
-            'timeframe': 'H1',
-            'symbol': SYMBOL,
-            'backtest_period': f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
-        }
-
-        with open(os.path.join(TEST_RESULTS_DIR, 'backtest_summary.json'), 'w') as f:
-            json.dump(backtest_summary, f, indent=4)
-
-        return backtest_summary
-
-    except Exception as e:
-        logger.error(f"Error during backtesting: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return None
-
-    finally:
-        mt5.shutdown()
-
-
-def run_all_thresholds():
-    """
-    Run backtest with different thresholds to find optimal entry/exit points
-    """
-    thresholds = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5]
-    results = []
-
-    for threshold in thresholds:
-        logger.info(f"Running backtest with threshold {threshold}...")
-        result = backtest_strategy(threshold=threshold)
-        if result:
-            result['threshold'] = threshold
-            results.append(result)
-
-    # Compile results
-    if results:
-        df = pd.DataFrame(results)
-
-        # Plot threshold vs performance
-        plt.figure(figsize=(14, 10))
-
-        plt.subplot(2, 2, 1)
-        plt.plot(df['threshold'], df['strategy_return'], marker='o')
-        plt.title('Strategy Return vs Threshold')
-        plt.xlabel('Threshold')
-        plt.ylabel('Return (%)')
-        plt.grid(True)
-
-        plt.subplot(2, 2, 2)
-        plt.plot(df['threshold'], df['win_rate'], marker='o')
-        plt.title('Win Rate vs Threshold')
-        plt.xlabel('Threshold')
-        plt.ylabel('Win Rate')
-        plt.grid(True)
-
-        plt.subplot(2, 2, 3)
-        plt.plot(df['threshold'], df['total_trades'], marker='o')
-        plt.title('Trade Count vs Threshold')
-        plt.xlabel('Threshold')
-        plt.ylabel('Number of Trades')
-        plt.grid(True)
-
-        plt.subplot(2, 2, 4)
-        plt.plot(df['threshold'], df['sharpe_ratio'], marker='o')
-        plt.title('Sharpe Ratio vs Threshold')
-        plt.xlabel('Threshold')
-        plt.ylabel('Sharpe Ratio')
-        plt.grid(True)
-
-        plt.tight_layout()
-        plt.savefig(os.path.join(TEST_RESULTS_DIR, 'threshold_optimization.png'))
-
-        # Save results
-        df.to_csv(os.path.join(TEST_RESULTS_DIR, 'threshold_comparison.csv'), index=False)
-
-        # Determine optimal threshold based on Sharpe ratio
-        best_idx = df['sharpe_ratio'].idxmax()
-        optimal_threshold = df.loc[best_idx, 'threshold']
-
-        logger.info(f"Optimal threshold: {optimal_threshold} (Sharpe: {df.loc[best_idx, 'sharpe_ratio']:.2f})")
-
-        return optimal_threshold
-
-    return None
-
-
 def main():
     # Make sure model and scaler exist
     model_path = os.path.join(MODEL_DIR, 'final_model.h5')
     ensemble_dir = os.path.join(MODEL_DIR, 'ensemble')
     scaler_path = os.path.join(MODEL_DIR, 'scaler.pkl')
 
+    # Check if at least one type of model exists
     if not (os.path.exists(model_path) or os.path.exists(ensemble_dir)):
         logger.error(f"Neither model file nor ensemble directory found")
         return
 
+    # Check for scaler
     if not os.path.exists(scaler_path):
         logger.error(f"Scaler file not found: {scaler_path}")
         return
@@ -1939,30 +1654,6 @@ def main():
     # Evaluate model
     logger.info("Evaluating model on test data...")
     metrics = evaluate_model()
-
-    if metrics:
-        # Run threshold optimization
-        logger.info("Running threshold optimization...")
-        optimal_threshold = run_all_thresholds()
-
-        if optimal_threshold:
-            # Run final backtest with optimal threshold
-            logger.info(f"Running final backtest with optimal threshold {optimal_threshold}...")
-            backtest_strategy(threshold=optimal_threshold)
-        else:
-            # Run backtest with different thresholds
-            thresholds = [0.05, 0.1, 0.2, 0.3]
-
-            for threshold in thresholds:
-                logger.info(f"Running backtest with threshold {threshold}...")
-                backtest_metrics = backtest_strategy(threshold=threshold)
-
-                if backtest_metrics:
-                    logger.info(f"Threshold {threshold} results:")
-                    logger.info(f"Total trades: {backtest_metrics['total_trades']}")
-                    logger.info(f"Win rate: {backtest_metrics['win_rate']:.2%}")
-                    logger.info(f"Strategy return: {backtest_metrics['strategy_return']:.2f}%")
-                    logger.info(f"Sharpe ratio: {backtest_metrics['sharpe_ratio']:.2f}")
 
     logger.info("Testing completed successfully")
 

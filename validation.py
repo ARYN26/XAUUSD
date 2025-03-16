@@ -21,8 +21,9 @@ import pytz
 import pickle
 import logging
 import json
-from scipy.stats import pearsonr
+from scipy.stats import pearsonr, shapiro
 import warnings
+
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
@@ -39,10 +40,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants - must match training
-LOOKBACK = 20
+LOOKBACK = 5
 SYMBOL = 'XAUUSD'  # Changed to Gold/USD
 TIMEFRAME = mt5.TIMEFRAME_H1
 VALIDATION_DIR = 'validation_results'
+MODEL_DIR = 'models'
 os.makedirs(VALIDATION_DIR, exist_ok=True)
 
 # Arizona time is UTC-7 (no DST)
@@ -70,6 +72,16 @@ def directional_accuracy(y_true, y_pred):
     Calculate directional accuracy (same sign)
     """
     return K.mean(K.cast(K.sign(y_true) == K.sign(y_pred), 'float32'))
+
+
+def mse(y_true, y_pred):
+    """Mean Squared Error metric"""
+    return K.mean(K.square(y_true - y_pred))
+
+
+def mae(y_true, y_pred):
+    """Mean Absolute Error metric"""
+    return K.mean(K.abs(y_true - y_pred))
 
 
 def connect_to_mt5(login, password, server="MetaQuotes-Demo"):
@@ -994,11 +1006,6 @@ def calculate_prediction_intervals(model, X_seq, confidence=0.95):
     # Make base predictions
     base_pred = model.predict(X_seq)
 
-    # Calculate absolute errors for base predictions
-    # We'll need a small subset of the validation data with known targets
-    # Let's just assume we have this for demonstration purposes
-    # In a real scenario, you'd calculate this on validation data
-
     # Generate synthetic absolute errors (normally you'd calculate these from validation)
     # This is just a placeholder - for real use, calculate from validation data
     synth_errors = np.abs(base_pred) * np.random.uniform(0.1, 0.3, size=base_pred.shape)
@@ -1048,38 +1055,56 @@ def statistical_hypothesis_testing(actual, predictions):
         results['correlation'] = {'error': str(e)}
 
     # 2. Test if directional accuracy is better than random (binomial test)
-    from scipy.stats import binom_test
+    try:
+        # Calculate directional accuracy values first
+        dir_correct = np.sum((np.sign(y_true) == np.sign(y_pred)))
+        total = len(y_true)
+        dir_accuracy = dir_correct / total
 
-    dir_correct = np.sum((np.sign(y_true) == np.sign(y_pred)))
-    total = len(y_true)
-    dir_accuracy = dir_correct / total
+        # Use scipy's binomtest (newer versions) or try binomial_test
+        try:
+            from scipy.stats import binomtest
+            p_value = binomtest(dir_correct, total, p=0.5).pvalue
+        except ImportError:
+            try:
+                from scipy.stats import binom_test
+                p_value = binom_test(dir_correct, total, p=0.5)
+            except ImportError:
+                # If neither is available, calculate p-value manually
+                from scipy.stats import binom
+                p_value = 2 * min(
+                    binom.cdf(dir_correct, total, 0.5),
+                    1 - binom.cdf(dir_correct - 1, total, 0.5)
+                )
 
-    # Binomial test against 0.5 (random guessing)
-    p_value = binom_test(dir_correct, total, p=0.5)
-
-    results['directional_test'] = {
-        'accuracy': dir_accuracy,
-        'p_value': p_value,
-        'significant': p_value < 0.05,
-        'interpretation': 'Directional accuracy is significantly better than random guessing'
-        if p_value < 0.05 else
-        'Directional accuracy is not significantly better than random guessing'
-    }
+        results['directional_test'] = {
+            'accuracy': dir_accuracy,
+            'p_value': p_value,
+            'significant': p_value < 0.05,
+            'interpretation': 'Directional accuracy is significantly better than random guessing'
+            if p_value < 0.05 else
+            'Directional accuracy is not significantly better than random guessing'
+        }
+    except Exception as e:
+        logger.error(f"Error in directional accuracy test: {e}")
+        results['directional_test'] = {'error': str(e)}
 
     # 3. Test for normality of residuals
-    from scipy.stats import shapiro
+    try:
+        residuals = y_true - y_pred
+        stat, p_value = shapiro(residuals)
 
-    residuals = y_true - y_pred
-    stat, p_value = shapiro(residuals)
-
-    results['residual_normality'] = {
-        'statistic': stat,
-        'p_value': p_value,
-        'normal': p_value >= 0.05,
-        'interpretation': 'Residuals are normally distributed'
-        if p_value >= 0.05 else
-        'Residuals are not normally distributed'
-    }
+        results['residual_normality'] = {
+            'statistic': stat,
+            'p_value': p_value,
+            'normal': p_value >= 0.05,
+            'interpretation': 'Residuals are normally distributed'
+            if p_value >= 0.05 else
+            'Residuals are not normally distributed'
+        }
+    except Exception as e:
+        logger.error(f"Error in residual normality test: {e}")
+        results['residual_normality'] = {'error': str(e)}
 
     return results
 
@@ -1254,67 +1279,79 @@ def walk_forward_validation(model, df, scaler, window_size=30, step_size=10, exp
 
     # Run statistical tests if enabled
     if STATISTICAL_TESTS:
-        logger.info("Running statistical hypothesis tests...")
-        stats_results = statistical_hypothesis_testing(results['actual'], results['prediction'])
+        try:
+            logger.info("Running statistical hypothesis tests...")
+            stats_results = statistical_hypothesis_testing(results['actual'], results['prediction'])
 
-        # Save statistical test results
-        with open(os.path.join(VALIDATION_DIR, 'statistical_tests.json'), 'w') as f:
-            json.dump(stats_results, f, indent=4)
+            # Save statistical test results
+            with open(os.path.join(VALIDATION_DIR, 'statistical_tests.json'), 'w') as f:
+                json.dump(stats_results, f, indent=4)
 
-        # Log key statistical results
-        logger.info(
-            f"Correlation: {stats_results['correlation']['value']:.4f} (p={stats_results['correlation']['p_value']:.4f})")
-        logger.info(f"Directional test p-value: {stats_results['directional_test']['p_value']:.4f}")
-        logger.info(f"Residuals normality p-value: {stats_results['residual_normality']['p_value']:.4f}")
+            # Log key statistical results
+            if 'correlation' in stats_results:
+                logger.info(
+                    f"Correlation: {stats_results['correlation']['value']:.4f} (p={stats_results['correlation']['p_value']:.4f})")
+            if 'directional_test' in stats_results:
+                logger.info(f"Directional test p-value: {stats_results['directional_test']['p_value']:.4f}")
+            if 'residual_normality' in stats_results:
+                logger.info(f"Residuals normality p-value: {stats_results['residual_normality']['p_value']:.4f}")
+        except Exception as e:
+            logger.error(f"Error during statistical testing: {e}")
 
     # Run Monte Carlo validation if enabled
     if USE_MONTE_CARLO:
-        logger.info("Running Monte Carlo validation...")
-        mc_results = monte_carlo_validation(model, X_seq, y_seq)
+        try:
+            logger.info("Running Monte Carlo validation...")
+            mc_results = monte_carlo_validation(model, X_seq, y_seq)
 
-        # Save Monte Carlo results
-        with open(os.path.join(VALIDATION_DIR, 'monte_carlo_results.json'), 'w') as f:
-            # Convert numpy values to Python native types for JSON serialization
-            mc_results_json = {}
-            for key, metrics in mc_results.items():
-                mc_results_json[key] = {
-                    k: v.item() if hasattr(v, 'item') else v if not isinstance(v, list) else [
-                        x.item() if hasattr(x, 'item') else x for x in v]
-                    for k, v in metrics.items()
-                }
-            json.dump(mc_results_json, f, indent=4)
+            # Save Monte Carlo results
+            with open(os.path.join(VALIDATION_DIR, 'monte_carlo_results.json'), 'w') as f:
+                # Convert numpy values to Python native types for JSON serialization
+                mc_results_json = {}
+                for key, metrics in mc_results.items():
+                    mc_results_json[key] = {
+                        k: v.item() if hasattr(v, 'item') else v if not isinstance(v, list) else [
+                            x.item() if hasattr(x, 'item') else x for x in v]
+                        for k, v in metrics.items()
+                    }
+                json.dump(mc_results_json, f, indent=4)
+        except Exception as e:
+            logger.error(f"Error during Monte Carlo validation: {e}")
 
     # Generate prediction intervals if enabled
     if PREDICTION_INTERVALS:
-        logger.info("Calculating prediction intervals...")
-        base_pred, lower_bounds, upper_bounds = calculate_prediction_intervals(model, X_seq)
+        try:
+            logger.info("Calculating prediction intervals...")
+            base_pred, lower_bounds, upper_bounds = calculate_prediction_intervals(model, X_seq)
 
-        # Store the last batch of results for plotting
-        interval_df = pd.DataFrame({
-            'actual': y_seq,
-            'prediction': base_pred.flatten(),
-            'lower_bound': lower_bounds,
-            'upper_bound': upper_bounds
-        })
+            # Store the last batch of results for plotting
+            interval_df = pd.DataFrame({
+                'actual': y_seq,
+                'prediction': base_pred.flatten(),
+                'lower_bound': lower_bounds,
+                'upper_bound': upper_bounds
+            })
 
-        # Plot prediction intervals
-        plt.figure(figsize=(14, 7))
-        plt.fill_between(
-            range(len(interval_df)),
-            interval_df['lower_bound'],
-            interval_df['upper_bound'],
-            alpha=0.2, color='blue',
-            label='95% Prediction Interval'
-        )
-        plt.plot(interval_df['prediction'], 'b-', label='Prediction')
-        plt.plot(interval_df['actual'], 'r-', label='Actual')
-        plt.title('Predictions with Confidence Intervals')
-        plt.xlabel('Sample')
-        plt.ylabel('Value')
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(os.path.join(VALIDATION_DIR, 'prediction_intervals.png'))
+            # Plot prediction intervals
+            plt.figure(figsize=(14, 7))
+            plt.fill_between(
+                range(len(interval_df)),
+                interval_df['lower_bound'],
+                interval_df['upper_bound'],
+                alpha=0.2, color='blue',
+                label='95% Prediction Interval'
+            )
+            plt.plot(interval_df['prediction'], 'b-', label='Prediction')
+            plt.plot(interval_df['actual'], 'r-', label='Actual')
+            plt.title('Predictions with Confidence Intervals')
+            plt.xlabel('Sample')
+            plt.ylabel('Value')
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(os.path.join(VALIDATION_DIR, 'prediction_intervals.png'))
+        except Exception as e:
+            logger.error(f"Error calculating prediction intervals: {e}")
 
     # Save results
     results.to_csv(os.path.join(VALIDATION_DIR, 'walk_forward_results.csv'), index=False)
@@ -1411,8 +1448,8 @@ def cross_validate_time_periods(model, df, scaler, expected_features=None):
     # Create a DataFrame for the data subset to match with date information
     df_subset = df.iloc[LOOKBACK:].reset_index(drop=True)
 
-    # Make sure we have enough data in the subset
-    if len(df_subset) < len(y_seq):
+    # Make sure we have enough data in the subset and arrays are properly aligned
+    if len(df_subset) != len(y_seq):
         logger.warning(f"Mismatch in data length: df_subset={len(df_subset)}, y_seq={len(y_seq)}")
         # Truncate to the shorter length
         min_len = min(len(df_subset), len(y_seq))
@@ -1429,12 +1466,15 @@ def cross_validate_time_periods(model, df, scaler, expected_features=None):
         day_mask = df_subset['day_of_week'] == day_num
         day_indices = np.where(day_mask)[0]
 
-        if len(day_indices) == 0:
+        # Ensure indices are within bounds
+        valid_indices = day_indices[day_indices < len(X_seq)]
+
+        if len(valid_indices) == 0:
             continue
 
-        # Get data for this day
-        X_day = X_seq[day_indices]
-        y_day = y_seq[day_indices]
+        # Get data for this day using only valid indices
+        X_day = X_seq[valid_indices]
+        y_day = y_seq[valid_indices]
 
         # Predict
         y_pred = model.predict(X_day, verbose=0)
@@ -1445,7 +1485,7 @@ def cross_validate_time_periods(model, df, scaler, expected_features=None):
         directional_acc = np.mean((np.sign(y_day) == np.sign(y_pred)).astype(int))
 
         day_results[days[day_num]] = {
-            'count': len(day_indices),
+            'count': len(valid_indices),
             'mse': mse,
             'mae': mae,
             'directional_accuracy': directional_acc
@@ -1464,12 +1504,15 @@ def cross_validate_time_periods(model, df, scaler, expected_features=None):
         month_mask = df_subset['month'] == month_num
         month_indices = np.where(month_mask)[0]
 
-        if len(month_indices) == 0:
+        # Ensure indices are within bounds
+        valid_indices = month_indices[month_indices < len(X_seq)]
+
+        if len(valid_indices) == 0:
             continue
 
-        # Get data for this month
-        X_month = X_seq[month_indices]
-        y_month = y_seq[month_indices]
+        # Get data for this month using only valid indices
+        X_month = X_seq[valid_indices]
+        y_month = y_seq[valid_indices]
 
         # Predict
         y_pred = model.predict(X_month, verbose=0)
@@ -1492,6 +1535,7 @@ def cross_validate_time_periods(model, df, scaler, expected_features=None):
 
     # Market regime analysis if available
     regime_df = None
+    # Market regime analysis if available
     if USE_MARKET_REGIMES and 'regime' in df_subset.columns:
         regime_results = {}
         regimes = ['Normal', 'Trending', 'Mean-Rev', 'Volatile']
@@ -1501,12 +1545,15 @@ def cross_validate_time_periods(model, df, scaler, expected_features=None):
             regime_mask = df_subset['regime'] == regime_id
             regime_indices = np.where(regime_mask)[0]
 
-            if len(regime_indices) == 0:
+            # Ensure indices are within bounds
+            valid_indices = regime_indices[regime_indices < len(X_seq)]
+
+            if len(valid_indices) == 0:
                 continue
 
-            # Get data for this regime
-            X_regime = X_seq[regime_indices]
-            y_regime = y_seq[regime_indices]
+            # Get data for this regime using only valid indices
+            X_regime = X_seq[valid_indices]
+            y_regime = y_seq[valid_indices]
 
             # Predict
             y_pred = model.predict(X_regime, verbose=0)
@@ -1631,7 +1678,9 @@ def load_ensemble_models(ensemble_dir):
             # Define custom metrics for loading
             custom_objects = {
                 'r2_keras': r2_keras,
-                'directional_accuracy': directional_accuracy
+                'directional_accuracy': directional_accuracy,
+                'mse': mse,
+                'mae': mae
             }
 
             model = load_model(model_path, custom_objects=custom_objects)
@@ -1713,7 +1762,9 @@ def main():
                         # Define custom metrics
                         custom_objects = {
                             'r2_keras': r2_keras,
-                            'directional_accuracy': directional_accuracy
+                            'directional_accuracy': directional_accuracy,
+                            'mse': mse,
+                            'mae': mae
                         }
 
                         model = load_model(model_path, custom_objects=custom_objects)
