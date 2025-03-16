@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-MT5 Neural Network Testing Script - Final Version
-Focus: 5 PM Arizona Time Data
+Enhanced MT5 Neural Network Testing Script
+Focus: 5 PM Arizona Time Data with Advanced Model Evaluation and Risk Management
+Implements findings from academic research papers on financial forecasting
 """
 
 import os
@@ -11,16 +12,22 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 import tensorflow as tf
-from tensorflow.keras.models import load_model
+from tensorflow.keras.models import load_model, Model
+from tensorflow.keras.layers import Input
 import tensorflow.keras.backend as K
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, precision_recall_curve, auc
 import MetaTrader5 as mt5
 import pytz
 import pickle
 import logging
 import io
 import re
+import json
 from contextlib import redirect_stdout
+import warnings
+
+# Suppress warnings
+warnings.filterwarnings('ignore')
 
 # Setup logging
 logging.basicConfig(
@@ -35,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 # Constants - must match training
 LOOKBACK = 20
-SYMBOL = 'EURUSD'
+SYMBOL = 'XAUUSD'  # Changed to Gold/USD as per repo name
 TIMEFRAME = mt5.TIMEFRAME_H1
 
 # Paths
@@ -46,6 +53,15 @@ os.makedirs(TEST_RESULTS_DIR, exist_ok=True)
 # Arizona time is UTC-7 (no DST)
 ARIZONA_TZ = pytz.timezone('US/Arizona')
 TARGET_HOUR = 17  # 5 PM Arizona time
+
+# Kelly fraction - risk management parameter
+KELLY_FRACTION = 0.5  # Conservative adjustment to Kelly criterion
+
+# Enable advanced analysis features
+USE_MARKET_REGIMES = True
+ENSEMBLE_PREDICTION = True
+RISK_MANAGEMENT = True
+CONFIDENCE_FILTERING = True  # Only take trades with high confidence
 
 
 # Define custom metrics for the model
@@ -190,7 +206,7 @@ def filter_5pm_data(df):
 
 def add_datetime_features(df):
     """
-    Add cyclical datetime features
+    Add cyclical datetime features - must match training
     """
     # Extract datetime components
     df['day_of_week'] = df['arizona_time'].dt.dayofweek
@@ -229,12 +245,116 @@ def add_datetime_features(df):
     df['quarter_sin'] = np.sin((df['quarter'] - 1) * (2 * np.pi / 4))
     df['quarter_cos'] = np.cos((df['quarter'] - 1) * (2 * np.pi / 4))
 
+    # Add day of week one-hot encoding (for matching features with training)
+    for i in range(7):
+        df[f'day_{i}'] = (df['day_of_week'] == i).astype(int)
+
+    # Add lunar cycle phase (can affect trading psychology)
+    # This is a simplified approximation
+    days_since_new_moon = (df['day_of_year'] % 29.53).astype(int)
+    df['lunar_sin'] = np.sin(days_since_new_moon * (2 * np.pi / 29.53))
+    df['lunar_cos'] = np.cos(days_since_new_moon * (2 * np.pi / 29.53))
+
+    return df
+
+
+def detect_market_regime(df, window=20):
+    """
+    Detect market regimes (trending, mean-reverting, volatile)
+    Based on research paper findings on regime-based trading
+    """
+    # Calculate returns
+    df['returns'] = df['close'].pct_change()
+
+    # Calculate volatility (standard deviation of returns)
+    df['volatility'] = df['returns'].rolling(window=window).std()
+
+    # Calculate autocorrelation - negative values suggest mean reversion
+    df['autocorrelation'] = df['returns'].rolling(window=window).apply(
+        lambda x: pd.Series(x).autocorr(lag=1) if len(x.dropna()) > 1 else np.nan, raw=False
+    )
+
+    # Calculate trend strength using Hurst exponent approximation
+    def hurst_exponent(returns, lags=range(2, 20)):
+        if len(returns.dropna()) < max(lags) + 1:
+            return np.nan
+
+        tau = []
+        std = []
+        for lag in lags:
+            # Construct a new series with lagged returns
+            series_lagged = pd.Series(returns).diff(lag).dropna()
+            if len(series_lagged) > 1:  # Ensure enough data
+                tau.append(lag)
+                std.append(np.std(series_lagged))
+
+        if len(tau) < 2:  # Need at least 2 points for regression
+            return np.nan
+
+        # Calculate Hurst exponent from log-log regression slope
+        m = np.polyfit(np.log(tau), np.log(std), 1)
+        hurst = m[0] / 2.0
+        return hurst
+
+    # Apply Hurst exponent calculation on rolling window
+    df['hurst'] = df['returns'].rolling(window=window * 2).apply(
+        lambda x: hurst_exponent(x) if len(x.dropna()) > window else np.nan, raw=False
+    )
+
+    # Classify regimes:
+    # Hurst > 0.6: Trending
+    # Hurst < 0.4: Mean-reverting
+    # Volatility > historical_avg*1.5: Volatile
+
+    vol_threshold = df['volatility'].mean() * 1.5
+
+    # Create regime flags
+    df['regime_trending'] = ((df['hurst'] > 0.6) & (df['volatility'] <= vol_threshold)).astype(int)
+    df['regime_mean_reverting'] = ((df['hurst'] < 0.4) & (df['volatility'] <= vol_threshold)).astype(int)
+    df['regime_volatile'] = (df['volatility'] > vol_threshold).astype(int)
+
+    # Create a composite regime indicator (could be used for model switching)
+    df['regime'] = 0  # Default/normal
+    df.loc[df['regime_trending'] == 1, 'regime'] = 1  # Trending
+    df.loc[df['regime_mean_reverting'] == 1, 'regime'] = 2  # Mean-reverting
+    df.loc[df['regime_volatile'] == 1, 'regime'] = 3  # Volatile
+
+    return df
+
+
+def add_wavelet_features(df, column='close', scales=[2, 4, 8, 16]):
+    """
+    Add wavelet transformation features
+    Based on research paper findings on wavelet decomposition for better feature extraction
+    Requires PyWavelets package
+    """
+    try:
+        import pywt
+
+        # Get the data we want to transform
+        data = df[column].values
+
+        for scale in scales:
+            # Calculate wavelet coefficients
+            coeff, _ = pywt.dwt(data, 'haar')
+
+            # Add as features
+            df[f'wavelet_{column}_{scale}'] = np.nan
+            df[f'wavelet_{column}_{scale}'].iloc[scale:] = coeff
+
+            # Fill NaN values with forward fill then backward fill
+            df[f'wavelet_{column}_{scale}'] = df[f'wavelet_{column}_{scale}'].fillna(method='ffill').fillna(
+                method='bfill')
+
+    except ImportError:
+        logger.warning("PyWavelets not installed, skipping wavelet features")
+
     return df
 
 
 def add_technical_indicators(df):
     """
-    Add technical analysis indicators using pandas
+    Add technical analysis indicators using pandas - must match training
     """
     # Ensure we have OHLCV data
     required_columns = ['open', 'high', 'low', 'close', 'volume']
@@ -253,68 +373,113 @@ def add_technical_indicators(df):
         df['high_low_diff_pct'] = (df['high'] - df['low']) / df['low'] * 100
 
         # Simple Moving Averages
-        for window in [5, 10, 20, 50, 100]:
+        for window in [5, 10, 20, 50, 100, 200]:
             df[f'sma_{window}'] = df['close'].rolling(window=window).mean()
 
         # Exponential Moving Averages
-        for window in [5, 10, 20, 50, 100]:
+        for window in [5, 10, 20, 50, 100, 200]:
             df[f'ema_{window}'] = df['close'].ewm(span=window, adjust=False).mean()
 
+        # Hull Moving Average (a more responsive moving average)
+        for window in [9, 16, 25]:
+            # Step 1: Calculate WMA with period n/2
+            half_length = int(window / 2)
+            df[f'wma_half_{window}'] = df['close'].rolling(window=half_length).apply(
+                lambda x: sum((i + 1) * x[-(i + 1)] for i in range(len(x))) / sum(i + 1 for i in range(len(x))),
+                raw=True
+            )
+
+            # Step 2: Calculate WMA for period n/4
+            quarter_length = int(window / 4)
+            df[f'wma_quarter_{window}'] = df['close'].rolling(window=quarter_length).apply(
+                lambda x: sum((i + 1) * x[-(i + 1)] for i in range(len(x))) / sum(i + 1 for i in range(len(x))),
+                raw=True
+            )
+
+            # Step 3: Calculate HMA
+            df[f'hma_{window}'] = df[f'wma_quarter_{window}'].rolling(window=int(np.sqrt(window))).apply(
+                lambda x: sum((i + 1) * x[-(i + 1)] for i in range(len(x))) / sum(i + 1 for i in range(len(x))),
+                raw=True
+            )
+
+            # Clean up intermediate columns
+            df = df.drop(columns=[f'wma_half_{window}', f'wma_quarter_{window}'])
+
         # Price relative to moving averages
-        for window in [5, 10, 20, 50]:
+        for window in [5, 10, 20, 50, 200]:
             df[f'price_sma_{window}_ratio'] = df['close'] / df[f'sma_{window}']
             df[f'price_ema_{window}_ratio'] = df['close'] / df[f'ema_{window}']
 
-        # Moving average crossovers
+        # Moving average crossovers - important trading signals
         df['sma_5_10_cross'] = np.where(df['sma_5'] > df['sma_10'], 1, -1)
         df['sma_10_20_cross'] = np.where(df['sma_10'] > df['sma_20'], 1, -1)
+        df['sma_50_200_cross'] = np.where(df['sma_50'] > df['sma_200'], 1, -1)  # Golden/Death cross
         df['ema_5_10_cross'] = np.where(df['ema_5'] > df['ema_10'], 1, -1)
+        df['ema_50_200_cross'] = np.where(df['ema_50'] > df['ema_200'], 1, -1)  # EMA-based golden/death cross
+
+        # Price momentum and acceleration
+        for window in [3, 5, 10, 20]:
+            # Momentum
+            df[f'momentum_{window}'] = df['close'] - df['close'].shift(window)
+            # Rate of change (percentage momentum)
+            df[f'roc_{window}'] = ((df['close'] / df['close'].shift(window)) - 1) * 100
+
+        # Acceleration (second derivative of price)
+        df['acceleration'] = df['close_diff'].diff()
+        df['acceleration_pct'] = df['close_diff_pct'].diff()
 
         # Volatility indicators
         df['volatility_10'] = df['close_diff_pct'].rolling(window=10).std()
         df['volatility_20'] = df['close_diff_pct'].rolling(window=20).std()
 
+        # ATRP (ATR Percentage - ATR relative to close price)
+        def calculate_atr(high, low, close, window=14):
+            tr1 = high - low
+            tr2 = abs(high - close.shift())
+            tr3 = abs(low - close.shift())
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            atr = tr.rolling(window=window).mean()
+            return atr
+
+        df['atr_14'] = calculate_atr(df['high'], df['low'], df['close'])
+        df['atrp_14'] = (df['atr_14'] / df['close']) * 100  # ATR as percentage of price
+
         # RSI (Relative Strength Index)
         def calculate_rsi(prices, window=14):
-            # Calculate price changes
             delta = prices.diff()
-
-            # Separate gains and losses
             gain = delta.where(delta > 0, 0)
             loss = -delta.where(delta < 0, 0)
-
-            # Calculate average gain and loss
             avg_gain = gain.rolling(window=window).mean()
             avg_loss = loss.rolling(window=window).mean()
-
-            # Calculate relative strength
             rs = avg_gain / avg_loss
-
-            # Calculate RSI
             rsi = 100 - (100 / (1 + rs))
-
             return rsi
 
         df['rsi_14'] = calculate_rsi(df['close'], window=14)
+        # Additional RSI periods
+        df['rsi_5'] = calculate_rsi(df['close'], window=5)
+        df['rsi_21'] = calculate_rsi(df['close'], window=21)
+
+        # RSI extreme levels and divergences
+        df['rsi_overbought'] = (df['rsi_14'] > 70).astype(int)
+        df['rsi_oversold'] = (df['rsi_14'] < 30).astype(int)
+
+        # RSI divergence (price making higher high while RSI makes lower high)
+        df['price_higher_high'] = ((df['high'] > df['high'].shift(1)) &
+                                   (df['high'].shift(1) > df['high'].shift(2))).astype(int)
+        df['rsi_lower_high'] = ((df['rsi_14'] < df['rsi_14'].shift(1)) &
+                                (df['rsi_14'].shift(1) > df['rsi_14'].shift(2))).astype(int)
+        df['bearish_divergence'] = ((df['price_higher_high'] == 1) &
+                                    (df['rsi_lower_high'] == 1)).astype(int)
 
         # Bollinger Bands
         def calculate_bollinger_bands(prices, window=20, num_std=2):
-            # Calculate middle band (simple moving average)
             middle_band = prices.rolling(window=window).mean()
-
-            # Calculate standard deviation
             std = prices.rolling(window=window).std()
-
-            # Calculate upper and lower bands
             upper_band = middle_band + (std * num_std)
             lower_band = middle_band - (std * num_std)
-
-            # Calculate Bollinger Band width
             bb_width = (upper_band - lower_band) / middle_band
-
-            # Calculate BB position
             bb_position = (prices - lower_band) / (upper_band - lower_band)
-
             return upper_band, middle_band, lower_band, bb_width, bb_position
 
         upper_band, middle_band, lower_band, bb_width, bb_position = calculate_bollinger_bands(df['close'])
@@ -326,19 +491,11 @@ def add_technical_indicators(df):
 
         # MACD (Moving Average Convergence Divergence)
         def calculate_macd(prices, fast_period=12, slow_period=26, signal_period=9):
-            # Calculate fast and slow EMA
             ema_fast = prices.ewm(span=fast_period, adjust=False).mean()
             ema_slow = prices.ewm(span=slow_period, adjust=False).mean()
-
-            # Calculate MACD line
             macd_line = ema_fast - ema_slow
-
-            # Calculate signal line
             signal_line = macd_line.ewm(span=signal_period, adjust=False).mean()
-
-            # Calculate histogram
             histogram = macd_line - signal_line
-
             return macd_line, signal_line, histogram
 
         macd_line, signal_line, histogram = calculate_macd(df['close'])
@@ -346,33 +503,42 @@ def add_technical_indicators(df):
         df['macd_signal'] = signal_line
         df['macd_hist'] = histogram
 
+        # MACD crossovers (important trading signals)
+        df['macd_crossover'] = np.where(df['macd'] > df['macd_signal'], 1,
+                                        np.where(df['macd'] < df['macd_signal'], -1, 0))
+
+        # MACD histogram sign change
+        df['macd_hist_sign_change'] = np.where(
+            (np.sign(df['macd_hist']) != np.sign(df['macd_hist'].shift(1))), 1, 0)
+
         # Stochastic Oscillator
         def calculate_stochastic(high, low, close, k_period=14, d_period=3):
-            # Calculate %K
             lowest_low = low.rolling(window=k_period).min()
             highest_high = high.rolling(window=k_period).max()
-
             k = 100 * ((close - lowest_low) / (highest_high - lowest_low))
-
-            # Calculate %D (simple moving average of %K)
             d = k.rolling(window=d_period).mean()
-
             return k, d
 
         k, d = calculate_stochastic(df['high'], df['low'], df['close'])
         df['stoch_k'] = k
         df['stoch_d'] = d
 
+        # Stochastic crossover
+        df['stoch_crossover'] = np.where(df['stoch_k'] > df['stoch_d'], 1,
+                                         np.where(df['stoch_k'] < df['stoch_d'], -1, 0))
+
+        # Stochastic overbought/oversold
+        df['stoch_overbought'] = (df['stoch_k'] > 80).astype(int)
+        df['stoch_oversold'] = (df['stoch_k'] < 20).astype(int)
+
         # Average True Range (ATR)
         def calculate_atr(high, low, close, window=14):
-            # Calculate true range
             tr1 = high - low
             tr2 = abs(high - close.shift())
             tr3 = abs(low - close.shift())
 
             tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-            # Calculate ATR
             atr = tr.rolling(window=window).mean()
 
             return atr
@@ -381,47 +547,30 @@ def add_technical_indicators(df):
 
         # Money Flow Index (MFI)
         def calculate_mfi(high, low, close, volume, window=14):
-            # Calculate typical price
             tp = (high + low + close) / 3
-
-            # Calculate raw money flow
             raw_money_flow = tp * volume
-
-            # Get the direction of money flow
             money_flow_positive = np.where(tp > tp.shift(1), raw_money_flow, 0)
             money_flow_negative = np.where(tp < tp.shift(1), raw_money_flow, 0)
-
-            # Convert to series
             money_flow_positive = pd.Series(money_flow_positive, index=high.index)
             money_flow_negative = pd.Series(money_flow_negative, index=high.index)
-
-            # Calculate money flow ratio
             positive_sum = money_flow_positive.rolling(window=window).sum()
             negative_sum = money_flow_negative.rolling(window=window).sum()
-
             money_flow_ratio = positive_sum / negative_sum
-
-            # Calculate MFI
             mfi = 100 - (100 / (1 + money_flow_ratio))
-
             return mfi
 
         df['mfi_14'] = calculate_mfi(df['high'], df['low'], df['close'], df['volume'])
 
+        # MFI overbought/oversold
+        df['mfi_overbought'] = (df['mfi_14'] > 80).astype(int)
+        df['mfi_oversold'] = (df['mfi_14'] < 20).astype(int)
+
         # Commodity Channel Index (CCI)
         def calculate_cci(high, low, close, window=20):
-            # Calculate typical price
             tp = (high + low + close) / 3
-
-            # Calculate simple moving average of typical price
             sma_tp = tp.rolling(window=window).mean()
-
-            # Calculate mean deviation
             mean_deviation = abs(tp - sma_tp).rolling(window=window).mean()
-
-            # Calculate CCI
             cci = (tp - sma_tp) / (0.015 * mean_deviation)
-
             return cci
 
         df['cci_20'] = calculate_cci(df['high'], df['low'], df['close'])
@@ -448,14 +597,171 @@ def add_technical_indicators(df):
 
         df['obv'] = calculate_obv(df['close'], df['volume'])
 
+        # OBV rate of change
+        df['obv_roc_10'] = calculate_roc(df['obv'], 10)
+
         # Volume indicators
         df['volume_ma_5'] = df['volume'].rolling(window=5).mean()
         df['volume_ma_10'] = df['volume'].rolling(window=10).mean()
         df['volume_ratio_5'] = df['volume'] / df['volume_ma_5']
         df['volume_ratio_10'] = df['volume'] / df['volume_ma_10']
 
+        # Volume change
+        df['volume_change'] = df['volume'].pct_change() * 100
+
+        # Price-volume divergence
+        df['price_up_volume_down'] = ((df['close_diff'] > 0) & (df['volume_change'] < 0)).astype(int)
+        df['price_down_volume_up'] = ((df['close_diff'] < 0) & (df['volume_change'] > 0)).astype(int)
+
         # Z-score of price
         df['zscore_20'] = (df['close'] - df['close'].rolling(window=20).mean()) / df['close'].rolling(window=20).std()
+
+        # Advanced indicators
+
+        # Ichimoku Cloud
+        def calculate_ichimoku(high, low, close):
+            # Tenkan-sen (Conversion Line): (highest high + lowest low)/2 for the past 9 periods
+            tenkan_sen = (high.rolling(window=9).max() + low.rolling(window=9).min()) / 2
+
+            # Kijun-sen (Base Line): (highest high + lowest low)/2 for the past 26 periods
+            kijun_sen = (high.rolling(window=26).max() + low.rolling(window=26).min()) / 2
+
+            # Senkou Span A (Leading Span A): (Conversion Line + Base Line)/2 shifted 26 periods forward
+            senkou_span_a = ((tenkan_sen + kijun_sen) / 2).shift(26)
+
+            # Senkou Span B (Leading Span B): (highest high + lowest low)/2 for past 52 periods, shifted 26 periods forward
+            senkou_span_b = ((high.rolling(window=52).max() + low.rolling(window=52).min()) / 2).shift(26)
+
+            # Chikou Span (Lagging Span): Close price shifted 26 periods backward
+            chikou_span = close.shift(-26)
+
+            return tenkan_sen, kijun_sen, senkou_span_a, senkou_span_b, chikou_span
+
+        tenkan, kijun, span_a, span_b, chikou = calculate_ichimoku(df['high'], df['low'], df['close'])
+        df['ichimoku_tenkan'] = tenkan
+        df['ichimoku_kijun'] = kijun
+        df['ichimoku_senkou_a'] = span_a
+        df['ichimoku_senkou_b'] = span_b
+        df['ichimoku_chikou'] = chikou
+
+        # Ichimoku trading signals
+        df['tenkan_kijun_cross'] = np.where(df['ichimoku_tenkan'] > df['ichimoku_kijun'], 1,
+                                            np.where(df['ichimoku_tenkan'] < df['ichimoku_kijun'], -1, 0))
+
+        # Price relative to cloud
+        df['price_above_cloud'] = np.where((df['close'] > df['ichimoku_senkou_a']) &
+                                           (df['close'] > df['ichimoku_senkou_b']), 1, 0)
+        df['price_below_cloud'] = np.where((df['close'] < df['ichimoku_senkou_a']) &
+                                           (df['close'] < df['ichimoku_senkou_b']), 1, 0)
+        df['cloud_bullish'] = np.where(df['ichimoku_senkou_a'] > df['ichimoku_senkou_b'], 1, 0)
+
+        # Elder Force Index
+        # Force Index: Price change * Volume
+        df['force_index_1'] = df['close'].diff(1) * df['volume']
+        df['force_index_13'] = df['force_index_1'].ewm(span=13, adjust=False).mean()
+
+        # Choppiness Index (market is trending or trading sideways)
+        def calculate_choppiness_index(high, low, close, window=14):
+            atr_sum = calculate_atr(high, low, close, 1).rolling(window=window).sum()
+            high_low_range = high.rolling(window=window).max() - low.rolling(window=window).min()
+            ci = 100 * np.log10(atr_sum / high_low_range) / np.log10(window)
+            return ci
+
+        df['choppiness_14'] = calculate_choppiness_index(df['high'], df['low'], df['close'])
+
+        # ADX (Average Directional Index) - trend strength
+        def calculate_adx(high, low, close, window=14):
+            # Calculate +DM and -DM
+            high_change = high.diff()
+            low_change = low.diff()
+
+            # +DM
+            pos_dm = np.where((high_change > 0) & (high_change > low_change.abs()), high_change, 0)
+            pos_dm = pd.Series(pos_dm, index=high.index)
+
+            # -DM
+            neg_dm = np.where((low_change < 0) & (low_change.abs() > high_change), low_change.abs(), 0)
+            neg_dm = pd.Series(neg_dm, index=low.index)
+
+            # Calculate True Range
+            tr1 = high - low
+            tr2 = abs(high - close.shift())
+            tr3 = abs(low - close.shift())
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+            # Calculate smoothed values
+            smoothed_tr = tr.rolling(window=window).sum()
+            smoothed_pos_dm = pos_dm.rolling(window=window).sum()
+            smoothed_neg_dm = neg_dm.rolling(window=window).sum()
+
+            # Calculate +DI and -DI
+            pos_di = 100 * (smoothed_pos_dm / smoothed_tr)
+            neg_di = 100 * (smoothed_neg_dm / smoothed_tr)
+
+            # Calculate DX and ADX
+            dx = 100 * (abs(pos_di - neg_di) / (pos_di + neg_di))
+            adx = dx.rolling(window=window).mean()
+
+            return pos_di, neg_di, adx
+
+        pos_di, neg_di, adx = calculate_adx(df['high'], df['low'], df['close'])
+        df['adx_pos_di'] = pos_di
+        df['adx_neg_di'] = neg_di
+        df['adx'] = adx
+
+        # ADX trend signals
+        df['adx_strong_trend'] = (df['adx'] > 25).astype(int)
+        df['adx_trend_direction'] = np.where(df['adx_pos_di'] > df['adx_neg_di'], 1, -1)
+
+        # Williams %R
+        def calculate_williams_r(high, low, close, window=14):
+            highest_high = high.rolling(window=window).max()
+            lowest_low = low.rolling(window=window).min()
+            wr = -100 * ((highest_high - close) / (highest_high - lowest_low))
+            return wr
+
+        df['williams_r_14'] = calculate_williams_r(df['high'], df['low'], df['close'])
+
+        # Williams %R overbought/oversold
+        df['williams_r_overbought'] = (df['williams_r_14'] > -20).astype(int)
+        df['williams_r_oversold'] = (df['williams_r_14'] < -80).astype(int)
+
+        # Gann High-Low Activator
+        def calculate_gann_hl(high, low, close, window=13):
+            avg = (high + low + close) / 3
+            avg_ma = avg.rolling(window=window).mean()
+            return avg_ma
+
+        df['gann_hl_13'] = calculate_gann_hl(df['high'], df['low'], df['close'])
+        df['gann_hl_signal'] = np.where(df['close'] > df['gann_hl_13'], 1, -1)
+
+        # Fibonacci retracement levels
+        # Use 100-day rolling window to find swings
+        window = 100
+        if len(df) >= window:
+            rolling_high = df['high'].rolling(window=window).max()
+            rolling_low = df['low'].rolling(window=window).min()
+
+            # Calculate key Fibonacci levels (23.6%, 38.2%, 50%, 61.8%)
+            df['fib_0'] = rolling_low
+            df['fib_236'] = rolling_low + 0.236 * (rolling_high - rolling_low)
+            df['fib_382'] = rolling_low + 0.382 * (rolling_high - rolling_low)
+            df['fib_500'] = rolling_low + 0.5 * (rolling_high - rolling_low)
+            df['fib_618'] = rolling_low + 0.618 * (rolling_high - rolling_low)
+            df['fib_100'] = rolling_high
+
+            # Check if price is near Fibonacci level (within 0.5%)
+            price_range = rolling_high - rolling_low
+            epsilon = 0.005 * price_range
+
+            df['near_fib_236'] = (abs(df['close'] - df['fib_236']) < epsilon).astype(int)
+            df['near_fib_382'] = (abs(df['close'] - df['fib_382']) < epsilon).astype(int)
+            df['near_fib_500'] = (abs(df['close'] - df['fib_500']) < epsilon).astype(int)
+            df['near_fib_618'] = (abs(df['close'] - df['fib_618']) < epsilon).astype(int)
+
+            # Combined Fibonacci signal
+            df['near_fib_level'] = ((df['near_fib_236'] + df['near_fib_382'] +
+                                     df['near_fib_500'] + df['near_fib_618']) > 0).astype(int)
 
     except Exception as e:
         logger.error(f"Error calculating technical indicators: {e}")
@@ -465,35 +771,34 @@ def add_technical_indicators(df):
     return df
 
 
-def add_lagged_features(df, lags=[1, 2, 3, 5]):
+def add_lagged_features(df, lags=[1, 2, 3, 5, 10]):
     """
-    Add lagged features for selected columns
+    Add lagged features for selected columns with more lags as suggested in research
     """
-    for lag in lags:
-        df[f'close_lag_{lag}'] = df['close'].shift(lag)
+    # Key indicators to lag
+    key_indicators = [
+        'close', 'close_diff', 'close_diff_pct', 'rsi_14', 'macd', 'bb_position',
+        'volatility_20', 'adx', 'stoch_k', 'mfi_14', 'obv', 'volume'
+    ]
 
-        if 'close_diff' in df.columns:
-            df[f'close_diff_lag_{lag}'] = df['close_diff'].shift(lag)
+    # Add lags for all key indicators
+    for col in key_indicators:
+        if col in df.columns:
+            for lag in lags:
+                df[f'{col}_lag_{lag}'] = df[col].shift(lag)
 
-        if 'close_diff_pct' in df.columns:
-            df[f'close_diff_pct_lag_{lag}'] = df['close_diff_pct'].shift(lag)
-
-        # Add lagged technical indicators
-        if 'rsi_14' in df.columns:
-            df[f'rsi_14_lag_{lag}'] = df['rsi_14'].shift(lag)
-
-        if 'macd' in df.columns:
-            df[f'macd_lag_{lag}'] = df['macd'].shift(lag)
-
-        if 'bb_position' in df.columns:
-            df[f'bb_position_lag_{lag}'] = df['bb_position'].shift(lag)
+    # Add rate of change between lags for close price
+    for lag in lags[1:]:  # Skip the first lag
+        if f'close_lag_{lag}' in df.columns and f'close_lag_1' in df.columns:
+            df[f'close_lag_{lag}_1_diff'] = ((df[f'close_lag_1'] - df[f'close_lag_{lag}']) /
+                                             df[f'close_lag_{lag}']) * 100
 
     return df
 
 
 def add_target_variables(df):
     """
-    Add target variables for prediction
+    Add target variables for prediction with multi-timeframe targets
     """
     # Calculate standard next period close price change
     df['next_close'] = df['close'].shift(-1)
@@ -507,15 +812,43 @@ def add_target_variables(df):
         df[f'close_future_{i}'] = df['close'].shift(-i)
         df[f'change_future_{i}_pct'] = ((df[f'close_future_{i}'] - df['close']) / df['close']) * 100
 
+    # Add volatility target (predict future volatility)
+    future_std = df['close_diff_pct'].rolling(window=5).std().shift(-5)
+    df['future_volatility'] = future_std
+
+    # Add probability of extreme move target
+    # Define extreme move as > 2 standard deviations
+    vol_threshold = df['volatility_20'] * 2
+    extreme_moves = []
+
+    for i in range(len(df) - 5):
+        max_move = df['close_diff_pct'].iloc[i + 1:i + 6].abs().max()
+        extreme_moves.append(1 if max_move > vol_threshold.iloc[i] else 0)
+
+    extreme_moves.extend([np.nan] * 5)  # Pad the end
+    df['extreme_move_5d'] = extreme_moves
+
+    # Add target for regime switches (if market regime detection is enabled)
+    if 'regime' in df.columns:
+        df['regime_switch'] = (df['regime'] != df['regime'].shift(1)).astype(int)
+        df['next_regime'] = df['regime'].shift(-1)
+
     return df
 
 
-def prepare_features_and_targets(df, target_col='next_close_change_pct'):
+def prepare_features_and_targets(df, target_col='next_close_change_pct', feature_blacklist=None):
     """
-    Prepare features and target variables
+    Prepare features and target variables with robust handling of missing features
     """
+    # Default blacklist if none provided
+    if feature_blacklist is None:
+        feature_blacklist = [
+            'time', 'arizona_time', 'next_close',
+            'close_future_2', 'close_future_3', 'close_future_4', 'close_future_5'
+        ]
+
     # Drop unnecessary columns
-    drop_cols = ['time', 'arizona_time', 'next_close'] + [f'close_future_{i}' for i in range(2, 6)]
+    drop_cols = feature_blacklist + [f'close_future_{i}' for i in range(2, 6)]
     feature_df = df.drop(columns=drop_cols, errors='ignore')
 
     # Handle NaN values
@@ -534,7 +867,9 @@ def prepare_features_and_targets(df, target_col='next_close_change_pct'):
     y = feature_df[target_col].values
 
     # Remove target columns from features
-    target_cols = ['next_close_change_pct', 'next_direction'] + [f'change_future_{i}_pct' for i in range(2, 6)]
+    target_cols = ['next_close_change_pct', 'next_direction', 'future_volatility', 'extreme_move_5d', 'regime_switch',
+                   'next_regime']
+    target_cols += [f'change_future_{i}_pct' for i in range(2, 6)]
     X = feature_df.drop(columns=target_cols, errors='ignore').values
 
     logger.info(f"Features shape: {X.shape}, Target shape: {y.shape}")
@@ -555,80 +890,214 @@ def create_sequences(X, y, lookback=LOOKBACK):
     return np.array(X_seq), np.array(y_seq)
 
 
-def evaluate_model():
+def load_ensemble_models(ensemble_dir):
     """
-    Evaluate the trained model on test data
+    Load ensemble of models from directory
     """
-    # Try three different methods to load the model
-    model = None
+    models = []
+    ensemble_weights_path = os.path.join(ensemble_dir, 'ensemble_weights.json')
 
-    # Method 1: Load with compile=False and recompile
+    if not os.path.exists(ensemble_weights_path):
+        logger.error(f"Ensemble weights file not found: {ensemble_weights_path}")
+        return None, None
+
+    # Load ensemble weights
     try:
-        model_path = os.path.join(MODEL_DIR, 'final_model.h5')
-        logger.info(f"Method 1: Loading model without compilation...")
-        model = load_model(model_path, compile=False)
-
-        # Recompile with custom metrics
-        model.compile(
-            optimizer='adam',
-            loss='mse',
-            metrics=[mae_custom, r2_keras, directional_accuracy]
-        )
-        logger.info(f"Model loaded and recompiled successfully")
-
+        with open(ensemble_weights_path, 'r') as f:
+            weights = json.load(f)
     except Exception as e:
-        logger.error(f"Method 1 failed: {e}")
+        logger.error(f"Error loading ensemble weights: {e}")
+        return None, None
 
-        # Method 2: Using custom_objects dictionary
+    # Load each model in the ensemble
+    for i in range(len(weights)):
         try:
-            logger.info(f"Method 2: Loading with custom objects...")
+            model_path = os.path.join(ensemble_dir, f'model_{i}.h5')
+
+            # Define custom metrics for loading
             custom_objects = {
                 'r2_keras': r2_keras,
                 'directional_accuracy': directional_accuracy,
-                'mse': mse_custom,
-                'mae': mae_custom
+                'mse_custom': mse_custom,
+                'mae_custom': mae_custom
             }
 
             model = load_model(model_path, custom_objects=custom_objects)
-            logger.info(f"Model loaded with custom objects")
+            models.append(model)
+            logger.info(f"Loaded ensemble model {i} from {model_path}")
         except Exception as e:
-            logger.error(f"Method 2 failed: {e}")
+            logger.error(f"Error loading ensemble model {i}: {e}")
+            return None, None
 
-            # Method 3: Create fresh model with same architecture
+    logger.info(f"Successfully loaded ensemble with {len(models)} models")
+    return models, weights
+
+
+def ensemble_predict(models, weights, X):
+    """
+    Make predictions with ensemble model using weighted average
+    """
+    predictions = []
+
+    # Get predictions from each model
+    for model in models:
+        pred = model.predict(X)
+        predictions.append(pred)
+
+    # Weighted average
+    weighted_preds = np.zeros_like(predictions[0])
+    for i, pred in enumerate(predictions):
+        weighted_preds += weights[i] * pred
+
+    return weighted_preds
+
+
+def calculate_kelly_criterion(predictions, actuals, position_type='long_short'):
+    """
+    Calculate Kelly criterion for optimal position sizing
+    position_type: 'long_short' for both directions, 'long_only' or 'short_only'
+    """
+    # Filter predictions based on position type
+    if position_type == 'long_only':
+        mask = predictions > 0
+        pred_filtered = predictions[mask]
+        actual_filtered = actuals[mask]
+    elif position_type == 'short_only':
+        mask = predictions < 0
+        pred_filtered = -predictions[mask]  # Flip sign for shorts
+        actual_filtered = -actuals[mask]  # Flip sign for shorts
+    else:  # long_short
+        pred_filtered = np.abs(predictions)
+        actual_filtered = actuals * np.sign(predictions)  # Align with prediction directions
+
+    if len(pred_filtered) == 0:
+        return 0.0  # No valid trades of this type
+
+    # Calculate win probability and average win/loss
+    wins = actual_filtered > 0
+    win_prob = np.mean(wins)
+
+    if win_prob == 0:
+        return 0.0  # No winning trades
+
+    avg_win = np.mean(actual_filtered[wins]) if any(wins) else 0
+    avg_loss = np.abs(np.mean(actual_filtered[~wins])) if any(~wins) else 0
+
+    if avg_loss == 0:
+        return 1.0  # No losing trades
+
+    # Calculate Kelly fraction
+    kelly = win_prob - ((1 - win_prob) / (avg_win / avg_loss))
+
+    # Limit to reasonable range
+    kelly = max(0, min(1, kelly))
+
+    return kelly
+
+
+def evaluate_model():
+    """
+    Evaluate the trained model on test data with enhanced analytics
+    """
+    # Check if we have an ensemble model
+    ensemble_dir = os.path.join(MODEL_DIR, 'ensemble')
+    ensemble_exists = os.path.exists(ensemble_dir)
+
+    # Load metadata first to check if we have an ensemble
+    metadata_path = os.path.join(MODEL_DIR, 'metadata.json')
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+                is_ensemble = metadata.get('is_ensemble', False)
+                logger.info(f"Model metadata loaded. Ensemble: {is_ensemble}")
+        except Exception as e:
+            logger.warning(f"Could not load metadata: {e}")
+            is_ensemble = ensemble_exists
+    else:
+        is_ensemble = ensemble_exists
+
+    # Load ensemble if available
+    if is_ensemble and ensemble_exists:
+        logger.info("Loading ensemble models...")
+        ensemble_models, ensemble_weights = load_ensemble_models(ensemble_dir)
+        if ensemble_models is None:
+            logger.warning("Failed to load ensemble, falling back to single model")
+            is_ensemble = False
+
+    # Try three different methods to load the model if not using ensemble
+    model = None
+    if not is_ensemble:
+        # Method 1: Load with compile=False and recompile
+        try:
+            model_path = os.path.join(MODEL_DIR, 'final_model.h5')
+            logger.info(f"Method 1: Loading model without compilation...")
+            model = load_model(model_path, compile=False)
+
+            # Recompile with custom metrics
+            model.compile(
+                optimizer='adam',
+                loss='mse',
+                metrics=[mae_custom, r2_keras, directional_accuracy]
+            )
+            logger.info(f"Model loaded and recompiled successfully")
+
+        except Exception as e:
+            logger.error(f"Method 1 failed: {e}")
+
+            # Method 2: Using custom_objects dictionary
             try:
-                logger.info(f"Method 3: Loading model weights only...")
+                logger.info(f"Method 2: Loading with custom objects...")
+                custom_objects = {
+                    'r2_keras': r2_keras,
+                    'directional_accuracy': directional_accuracy,
+                    'mse_custom': mse_custom,
+                    'mae_custom': mae_custom
+                }
 
-                # Get the model architecture from the saved file
-                if os.path.exists(os.path.join(MODEL_DIR, 'model_architecture.json')):
-                    with open(os.path.join(MODEL_DIR, 'model_architecture.json'), 'r') as f:
-                        import json
-                        model_json = json.load(f)
-
-                    from tensorflow.keras.models import model_from_json
-                    model = model_from_json(model_json)
-                    model.load_weights(model_path)
-
-                    # Compile the model
-                    model.compile(
-                        optimizer='adam',
-                        loss='mse',
-                        metrics=[mae_custom, r2_keras, directional_accuracy]
-                    )
-                    logger.info(f"Model loaded from architecture and weights")
-                else:
-                    logger.error("Model architecture file not found, cannot proceed")
-                    return None
+                model = load_model(model_path, custom_objects=custom_objects)
+                logger.info(f"Model loaded with custom objects")
             except Exception as e:
-                logger.error(f"Method 3 failed: {e}")
-                logger.error("All model loading methods failed, cannot proceed with evaluation")
-                return None
+                logger.error(f"Method 2 failed: {e}")
 
-    if model is None:
+                # Method 3: Create fresh model with same architecture
+                try:
+                    logger.info(f"Method 3: Loading model weights only...")
+
+                    # Get the model architecture from the saved file
+                    if os.path.exists(os.path.join(MODEL_DIR, 'model_architecture.json')):
+                        with open(os.path.join(MODEL_DIR, 'model_architecture.json'), 'r') as f:
+                            model_json = f.read()
+
+                        from tensorflow.keras.models import model_from_json
+                        model = model_from_json(model_json)
+                        model.load_weights(model_path)
+
+                        # Compile the model
+                        model.compile(
+                            optimizer='adam',
+                            loss='mse',
+                            metrics=[mae_custom, r2_keras, directional_accuracy]
+                        )
+                        logger.info(f"Model loaded from architecture and weights")
+                    else:
+                        logger.error("Model architecture file not found, cannot proceed")
+                        return None
+                except Exception as e:
+                    logger.error(f"Method 3 failed: {e}")
+                    logger.error("All model loading methods failed, cannot proceed with evaluation")
+                    return None
+
+    if not is_ensemble and model is None:
         logger.error("Failed to load model using any method")
         return None
 
     # Extract expected feature count
-    expected_features = inspect_model_input_shape(model)
+    if is_ensemble:
+        expected_features = inspect_model_input_shape(ensemble_models[0])
+    else:
+        expected_features = inspect_model_input_shape(model)
+
     if expected_features:
         logger.info(f"Model expects {expected_features} input features")
     else:
@@ -685,6 +1154,18 @@ def evaluate_model():
         logger.info("Adding datetime features...")
         df_5pm = add_datetime_features(df_5pm)
 
+        # Add market regime detection if enabled
+        if USE_MARKET_REGIMES:
+            logger.info("Detecting market regimes...")
+            df_5pm = detect_market_regime(df_5pm)
+
+        # Add wavelet features
+        try:
+            logger.info("Adding wavelet features...")
+            df_5pm = add_wavelet_features(df_5pm)
+        except Exception as e:
+            logger.warning(f"Error adding wavelet features: {e}. Skipping.")
+
         logger.info("Adding technical indicators...")
         df_5pm = add_technical_indicators(df_5pm)
 
@@ -726,7 +1207,10 @@ def evaluate_model():
         logger.info(f"Test data shape: {X_seq.shape}")
 
         # Make predictions
-        y_pred = model.predict(X_seq)
+        if is_ensemble:
+            y_pred = ensemble_predict(ensemble_models, ensemble_weights, X_seq)
+        else:
+            y_pred = model.predict(X_seq)
 
         # Calculate metrics
         mse = mean_squared_error(y_seq, y_pred)
@@ -737,55 +1221,189 @@ def evaluate_model():
         # Directional accuracy
         directional_acc = np.mean((np.sign(y_seq) == np.sign(y_pred)).astype(int))
 
+        # Calculate precision-recall for extreme moves (if predicted magnitude > 0.5% and actual direction matches)
+        extreme_threshold = 0.5  # Consider moves > 0.5% as significant
+        y_extreme_pred = np.abs(y_pred) > extreme_threshold
+        y_extreme_actual = np.abs(y_seq) > extreme_threshold
+        y_dir_match = np.sign(y_seq) == np.sign(y_pred)
+        y_extreme_match = y_extreme_actual & y_dir_match & y_extreme_pred
+
+        # Calculate precision/recall
+        if any(y_extreme_pred):
+            precision = np.sum(y_extreme_match) / np.sum(y_extreme_pred)
+        else:
+            precision = 0
+
+        if any(y_extreme_actual):
+            recall = np.sum(y_extreme_match) / np.sum(y_extreme_actual)
+        else:
+            recall = 0
+
+        # Calculate risk metrics
+        if RISK_MANAGEMENT:
+            # Calculate Kelly criterion for different position types
+            kelly_long = calculate_kelly_criterion(y_pred, y_seq, 'long_only')
+            kelly_short = calculate_kelly_criterion(y_pred, y_seq, 'short_only')
+            kelly_combined = calculate_kelly_criterion(y_pred, y_seq, 'long_short')
+
+            # Apply KELLY_FRACTION to get conservative position sizing
+            position_size_long = kelly_long * KELLY_FRACTION
+            position_size_short = kelly_short * KELLY_FRACTION
+            position_size_combined = kelly_combined * KELLY_FRACTION
+
+            logger.info(f"Kelly Position Sizing:")
+            logger.info(f"Long: {position_size_long:.2%}")
+            logger.info(f"Short: {position_size_short:.2%}")
+            logger.info(f"Combined: {position_size_combined:.2%}")
+
+            risk_metrics = {
+                'kelly_long': kelly_long,
+                'kelly_short': kelly_short,
+                'kelly_combined': kelly_combined,
+                'position_size_long': position_size_long,
+                'position_size_short': position_size_short,
+                'position_size_combined': position_size_combined
+            }
+        else:
+            risk_metrics = {}
+
+        # Log metrics
         logger.info(f"Test Metrics:")
         logger.info(f"MSE: {mse:.6f}")
         logger.info(f"RMSE: {rmse:.6f}")
         logger.info(f"MAE: {mae:.6f}")
         logger.info(f"R²: {r2:.6f}")
         logger.info(f"Directional Accuracy: {directional_acc:.2%}")
+        logger.info(f"Extreme Move Precision: {precision:.2%}")
+        logger.info(f"Extreme Move Recall: {recall:.2%}")
+
+        # Create a DataFrame with dates and predictions for better analysis
+        test_dates = df_5pm.iloc[LOOKBACK:]['arizona_time'].reset_index(drop=True)[:len(y_pred)]
+
+        results_df = pd.DataFrame({
+            'date': test_dates,
+            'actual': y_seq.flatten(),
+            'prediction': y_pred.flatten()
+        })
+
+        # Mark extreme moves
+        results_df['extreme_actual'] = np.abs(results_df['actual']) > extreme_threshold
+        results_df['extreme_pred'] = np.abs(results_df['prediction']) > extreme_threshold
+
+        # Add market regimes if enabled
+        if USE_MARKET_REGIMES and 'regime' in df_5pm.columns:
+            regime_data = df_5pm.iloc[LOOKBACK:][['regime', 'regime_trending',
+                                                  'regime_mean_reverting', 'regime_volatile']].reset_index(drop=True)
+
+            # Add regime information to results
+            results_df = pd.concat([
+                results_df,
+                regime_data.iloc[:len(results_df)].reset_index(drop=True)
+            ], axis=1)
+
+            # Calculate performance by regime
+            for regime_name, regime_id in zip(['Normal', 'Trending', 'Mean-Rev', 'Volatile'], range(4)):
+                mask = results_df['regime'] == regime_id
+                if mask.sum() > 0:
+                    regime_acc = np.mean((np.sign(results_df.loc[mask, 'actual']) ==
+                                          np.sign(results_df.loc[mask, 'prediction'])).astype(int))
+                    logger.info(f"Directional Accuracy in {regime_name} regime: {regime_acc:.2%}")
 
         # Plot predictions vs actual
         plt.figure(figsize=(14, 7))
-        plt.plot(y_seq, label='Actual', alpha=0.7)
-        plt.plot(y_pred, label='Predicted', alpha=0.7)
+        plt.plot(results_df['date'], results_df['actual'], label='Actual', alpha=0.7)
+        plt.plot(results_df['date'], results_df['prediction'], label='Predicted', alpha=0.7)
         plt.title('Model Predictions vs Actual Values')
-        plt.xlabel('Time Step')
+        plt.xlabel('Date')
         plt.ylabel('Price Change (%)')
         plt.legend()
         plt.grid(True)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
         plt.savefig(os.path.join(TEST_RESULTS_DIR, 'test_predictions.png'))
 
         # Plot prediction error
         plt.figure(figsize=(14, 7))
-        prediction_error = y_seq - y_pred.flatten()
-        plt.plot(prediction_error)
+        results_df['error'] = results_df['actual'] - results_df['prediction']
+        plt.plot(results_df['date'], results_df['error'])
         plt.axhline(y=0, color='r', linestyle='-', alpha=0.3)
         plt.title('Prediction Error')
-        plt.xlabel('Time Step')
+        plt.xlabel('Date')
         plt.ylabel('Error')
         plt.grid(True)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
         plt.savefig(os.path.join(TEST_RESULTS_DIR, 'prediction_error.png'))
 
         # Plot scatter of predicted vs actual
         plt.figure(figsize=(10, 10))
-        plt.scatter(y_seq, y_pred)
+        plt.scatter(results_df['actual'], results_df['prediction'])
         plt.title('Actual vs Predicted')
         plt.xlabel('Actual')
         plt.ylabel('Predicted')
 
         # Add 45-degree line
-        min_val = min(np.min(y_seq), np.min(y_pred))
-        max_val = max(np.max(y_seq), np.max(y_pred))
+        min_val = min(np.min(results_df['actual']), np.min(results_df['prediction']))
+        max_val = max(np.max(results_df['actual']), np.max(results_df['prediction']))
         plt.plot([min_val, max_val], [min_val, max_val], 'r--')
         plt.grid(True)
         plt.savefig(os.path.join(TEST_RESULTS_DIR, 'scatter_comparison.png'))
+
+        # Save results DataFrame for further analysis
+        results_df.to_csv(os.path.join(TEST_RESULTS_DIR, 'test_results.csv'), index=False)
+
+        # Plot confidence analysis (magnitude of prediction vs accuracy)
+        plt.figure(figsize=(12, 6))
+
+        # Group predictions by magnitude
+        results_df['pred_abs'] = np.abs(results_df['prediction'])
+        results_df['correct'] = np.sign(results_df['actual']) == np.sign(results_df['prediction'])
+
+        # Create bins by prediction magnitude
+        bins = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 1.0, 100]
+        bin_labels = ['0-0.1%', '0.1-0.2%', '0.2-0.3%', '0.3-0.4%', '0.4-0.5%', '0.5-1.0%', '1.0%+']
+        results_df['magnitude_bin'] = pd.cut(results_df['pred_abs'], bins=bins, labels=bin_labels)
+
+        # Calculate accuracy by bin
+        accuracy_by_magnitude = results_df.groupby('magnitude_bin')['correct'].mean()
+        count_by_magnitude = results_df.groupby('magnitude_bin').size()
+
+        # Plot accuracy by prediction magnitude
+        ax = plt.subplot(1, 2, 1)
+        accuracy_by_magnitude.plot(kind='bar', ax=ax)
+        plt.title('Accuracy by Prediction Magnitude')
+        plt.xlabel('Predicted Magnitude')
+        plt.ylabel('Directional Accuracy')
+        plt.ylim(0, 1)
+
+        # Add count labels
+        for i, v in enumerate(accuracy_by_magnitude):
+            plt.text(i, v + 0.02, f"n={count_by_magnitude.iloc[i]}", ha='center')
+
+        # Plot trade distribution
+        ax = plt.subplot(1, 2, 2)
+        count_by_magnitude.plot(kind='bar', ax=ax)
+        plt.title('Trade Count by Prediction Magnitude')
+        plt.xlabel('Predicted Magnitude')
+        plt.ylabel('Number of Trades')
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(TEST_RESULTS_DIR, 'confidence_analysis.png'))
+
+        # Save risk management data if enabled
+        if RISK_MANAGEMENT:
+            with open(os.path.join(TEST_RESULTS_DIR, 'risk_metrics.json'), 'w') as f:
+                json.dump(risk_metrics, f, indent=4)
 
         return {
             'mse': mse,
             'rmse': rmse,
             'mae': mae,
             'r2': r2,
-            'directional_accuracy': directional_acc
+            'directional_accuracy': directional_acc,
+            'extreme_precision': precision,
+            'extreme_recall': recall,
+            'risk_metrics': risk_metrics if RISK_MANAGEMENT else {}
         }
 
     except Exception as e:
@@ -802,81 +1420,110 @@ def backtest_strategy(threshold=0.1):
     """
     Backtest the trained model strategy on historical data
     """
-    # Try three different methods to load the model
-    model = None
+    # Check if we have an ensemble model
+    ensemble_dir = os.path.join(MODEL_DIR, 'ensemble')
+    ensemble_exists = os.path.exists(ensemble_dir)
 
-    # Method 1: Load with compile=False and recompile
-    try:
-        model_path = os.path.join(MODEL_DIR, 'final_model.h5')
-        logger.info(f"Method 1: Loading model without compilation...")
-        model = load_model(model_path, compile=False)
-
-        # Recompile with custom metrics
-        model.compile(
-            optimizer='adam',
-            loss='mse',
-            metrics=[mae_custom, r2_keras, directional_accuracy]
-        )
-        logger.info(f"Model loaded and recompiled successfully")
-
-    except Exception as e:
-        logger.error(f"Method 1 failed: {e}")
-
-        # Method 2: Using custom_objects dictionary
+    # Load metadata first to check if we have an ensemble
+    metadata_path = os.path.join(MODEL_DIR, 'metadata.json')
+    if os.path.exists(metadata_path):
         try:
-            logger.info(f"Method 2: Loading with custom objects...")
-            custom_objects = {
-                'r2_keras': r2_keras,
-                'directional_accuracy': directional_accuracy,
-                'mse': mse_custom,
-                'mae': mae_custom
-            }
-
-            model = load_model(model_path, custom_objects=custom_objects)
-            logger.info(f"Model loaded with custom objects")
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+                is_ensemble = metadata.get('is_ensemble', False)
+                logger.info(f"Model metadata loaded. Ensemble: {is_ensemble}")
         except Exception as e:
-            logger.error(f"Method 2 failed: {e}")
+            logger.warning(f"Could not load metadata: {e}")
+            is_ensemble = ensemble_exists
+    else:
+        is_ensemble = ensemble_exists
 
-            # Method 3: Create fresh model with same architecture
+    # Load ensemble if available
+    if is_ensemble and ensemble_exists:
+        logger.info("Loading ensemble models...")
+        ensemble_models, ensemble_weights = load_ensemble_models(ensemble_dir)
+        if ensemble_models is None:
+            logger.warning("Failed to load ensemble, falling back to single model")
+            is_ensemble = False
+
+    # Try three different methods to load the model if not using ensemble
+    model = None
+    if not is_ensemble:
+        # Method 1: Load with compile=False and recompile
+        try:
+            model_path = os.path.join(MODEL_DIR, 'final_model.h5')
+            logger.info(f"Method 1: Loading model without compilation...")
+            model = load_model(model_path, compile=False)
+
+            # Recompile with custom metrics
+            model.compile(
+                optimizer='adam',
+                loss='mse',
+                metrics=[mae_custom, r2_keras, directional_accuracy]
+            )
+            logger.info(f"Model loaded and recompiled successfully")
+
+        except Exception as e:
+            logger.error(f"Method 1 failed: {e}")
+
+            # Method 2: Using custom_objects dictionary
             try:
-                logger.info(f"Method 3: Loading model weights only...")
+                logger.info(f"Method 2: Loading with custom objects...")
+                custom_objects = {
+                    'r2_keras': r2_keras,
+                    'directional_accuracy': directional_accuracy,
+                    'mse_custom': mse_custom,
+                    'mae_custom': mae_custom
+                }
 
-                # Get the model architecture from the saved file
-                if os.path.exists(os.path.join(MODEL_DIR, 'model_architecture.json')):
-                    with open(os.path.join(MODEL_DIR, 'model_architecture.json'), 'r') as f:
-                        import json
-                        model_json = json.load(f)
-
-                    from tensorflow.keras.models import model_from_json
-                    model = model_from_json(model_json)
-                    model.load_weights(model_path)
-
-                    # Compile the model
-                    model.compile(
-                        optimizer='adam',
-                        loss='mse',
-                        metrics=[mae_custom, r2_keras, directional_accuracy]
-                    )
-                    logger.info(f"Model loaded from architecture and weights")
-                else:
-                    logger.error("Model architecture file not found, cannot proceed")
-                    return None
+                model = load_model(model_path, custom_objects=custom_objects)
+                logger.info(f"Model loaded with custom objects")
             except Exception as e:
-                logger.error(f"Method 3 failed: {e}")
-                logger.error("All model loading methods failed, cannot proceed with evaluation")
-                return None
+                logger.error(f"Method 2 failed: {e}")
 
-    if model is None:
+                # Method 3: Create fresh model with same architecture
+                try:
+                    logger.info(f"Method 3: Loading model weights only...")
+
+                    # Get the model architecture from the saved file
+                    if os.path.exists(os.path.join(MODEL_DIR, 'model_architecture.json')):
+                        with open(os.path.join(MODEL_DIR, 'model_architecture.json'), 'r') as f:
+                            model_json = f.read()
+
+                        from tensorflow.keras.models import model_from_json
+                        model = model_from_json(model_json)
+                        model.load_weights(model_path)
+
+                        # Compile the model
+                        model.compile(
+                            optimizer='adam',
+                            loss='mse',
+                            metrics=[mae_custom, r2_keras, directional_accuracy]
+                        )
+                        logger.info(f"Model loaded from architecture and weights")
+                    else:
+                        logger.error("Model architecture file not found, cannot proceed")
+                        return None
+                except Exception as e:
+                    logger.error(f"Method 3 failed: {e}")
+                    logger.error("All model loading methods failed, cannot proceed with evaluation")
+                    return None
+
+    if not is_ensemble and model is None:
         logger.error("Failed to load model using any method")
         return None
 
     # Extract expected feature count
-    expected_features = inspect_model_input_shape(model)
+    if is_ensemble:
+        expected_features = inspect_model_input_shape(ensemble_models[0])
+    else:
+        expected_features = inspect_model_input_shape(model)
+
     if expected_features:
         logger.info(f"Model expects {expected_features} input features")
     else:
         logger.warning("Could not determine expected feature count, using default")
-        expected_features = 103  # Based on the enhanced training logs
+        expected_features = 103  # Based on enhanced training
 
     # Load scaler
     try:
@@ -916,6 +1563,18 @@ def backtest_strategy(threshold=0.1):
         # Add features to match the features used in training
         logger.info("Adding datetime features...")
         df_5pm = add_datetime_features(df_5pm)
+
+        # Add market regime detection if enabled
+        if USE_MARKET_REGIMES:
+            logger.info("Detecting market regimes...")
+            df_5pm = detect_market_regime(df_5pm)
+
+        # Add wavelet features
+        try:
+            logger.info("Adding wavelet features...")
+            df_5pm = add_wavelet_features(df_5pm)
+        except Exception as e:
+            logger.warning(f"Error adding wavelet features: {e}. Skipping.")
 
         logger.info("Adding technical indicators...")
         df_5pm = add_technical_indicators(df_5pm)
@@ -958,24 +1617,112 @@ def backtest_strategy(threshold=0.1):
         logger.info(f"Backtest data shape: {X_seq.shape}")
 
         # Make predictions
-        predictions = model.predict(X_seq)
+        if is_ensemble:
+            predictions = ensemble_predict(ensemble_models, ensemble_weights, X_seq)
+        else:
+            predictions = model.predict(X_seq)
 
         # Create results DataFrame with dates
         dates = df_5pm.iloc[LOOKBACK:]['arizona_time'].reset_index(drop=True)
 
         df_results = pd.DataFrame({
-            'date': dates,
+            'date': dates[:len(predictions)],
             'actual': y_seq.flatten(),
             'prediction': predictions.flatten()
         })
 
-        # Set up trading strategy
-        df_results['signal'] = 0  # 0 = no trade, 1 = buy, -1 = sell
-        df_results.loc[df_results['prediction'] > threshold, 'signal'] = 1
-        df_results.loc[df_results['prediction'] < -threshold, 'signal'] = -1
+        # Add confidence score (absolute value of prediction)
+        df_results['confidence'] = np.abs(df_results['prediction'])
 
-        # Calculate returns
-        df_results['strategy_return'] = df_results['signal'] * df_results['actual']
+        # Add market regime information if available
+        if USE_MARKET_REGIMES and 'regime' in df_5pm.columns:
+            regime_data = df_5pm.iloc[LOOKBACK:][['regime', 'regime_trending',
+                                                  'regime_mean_reverting', 'regime_volatile']].reset_index(drop=True)
+
+            # Add regime information to results
+            df_results = pd.concat([
+                df_results,
+                regime_data.iloc[:len(df_results)].reset_index(drop=True)
+            ], axis=1)
+
+        # Set up trading strategy with confidence filtering
+        df_results['signal'] = 0  # 0 = no trade, 1 = buy, -1 = sell
+
+        if CONFIDENCE_FILTERING:
+            # Only take trades above threshold and with higher confidence
+            df_results.loc[(df_results['prediction'] > threshold) &
+                           (df_results['confidence'] > threshold * 1.5), 'signal'] = 1
+
+            df_results.loc[(df_results['prediction'] < -threshold) &
+                           (df_results['confidence'] > threshold * 1.5), 'signal'] = -1
+        else:
+            # Standard threshold approach
+            df_results.loc[df_results['prediction'] > threshold, 'signal'] = 1
+            df_results.loc[df_results['prediction'] < -threshold, 'signal'] = -1
+
+        # Use regime-specific thresholds if enabled and available
+        if USE_MARKET_REGIMES and 'regime' in df_results.columns:
+            # Adjust thresholds by regime
+            # Lower thresholds in trending markets (more trades)
+            # Higher thresholds in volatile markets (fewer trades)
+            trending_threshold = threshold * 0.8
+            volatile_threshold = threshold * 1.5
+
+            # Trending regime - lower threshold for trades
+            df_results.loc[(df_results['regime'] == 1) &
+                           (df_results['prediction'] > trending_threshold), 'signal'] = 1
+            df_results.loc[(df_results['regime'] == 1) &
+                           (df_results['prediction'] < -trending_threshold), 'signal'] = -1
+
+            # Volatile regime - higher threshold for trades
+            df_results.loc[df_results['regime'] == 3, 'signal'] = 0  # Reset signals
+            df_results.loc[(df_results['regime'] == 3) &
+                           (df_results['prediction'] > volatile_threshold), 'signal'] = 1
+            df_results.loc[(df_results['regime'] == 3) &
+                           (df_results['prediction'] < -volatile_threshold), 'signal'] = -1
+
+        # Apply position sizing if risk management is enabled
+        if RISK_MANAGEMENT:
+            # Calculate Kelly criterion for each signal
+            long_signals = df_results['signal'] == 1
+            short_signals = df_results['signal'] == -1
+
+            # Calculate Kelly for long and short positions
+            kelly_long = calculate_kelly_criterion(
+                df_results.loc[long_signals, 'prediction'],
+                df_results.loc[long_signals, 'actual'],
+                'long_only'
+            ) if any(long_signals) else 0
+
+            kelly_short = calculate_kelly_criterion(
+                df_results.loc[short_signals, 'prediction'],
+                df_results.loc[short_signals, 'actual'],
+                'short_only'
+            ) if any(short_signals) else 0
+
+            # Apply risk adjustment
+            position_size_long = kelly_long * KELLY_FRACTION
+            position_size_short = kelly_short * KELLY_FRACTION
+
+            # Scale position size by confidence (prediction magnitude)
+            df_results['position_size'] = 0.0
+
+            # Apply position sizing but ensure it doesn't exceed max
+            df_results.loc[long_signals, 'position_size'] = np.minimum(
+                position_size_long * (df_results.loc[long_signals, 'confidence'] / threshold),
+                1.0  # Max position size is 100%
+            )
+
+            df_results.loc[short_signals, 'position_size'] = np.minimum(
+                position_size_short * (df_results.loc[short_signals, 'confidence'] / threshold),
+                1.0  # Max position size is 100%
+            )
+
+            # Calculate dynamic position-sized returns
+            df_results['strategy_return'] = df_results['signal'] * df_results['position_size'] * df_results['actual']
+        else:
+            # Simple fixed position sizing
+            df_results['strategy_return'] = df_results['signal'] * df_results['actual']
 
         # Calculate cumulative returns
         df_results['cumulative_market_return'] = df_results['actual'].cumsum()
@@ -989,6 +1736,19 @@ def backtest_strategy(threshold=0.1):
         market_return = df_results['cumulative_market_return'].iloc[-1]
         strategy_return = df_results['cumulative_strategy_return'].iloc[-1]
 
+        # Calculate Sharpe Ratio (assume risk-free rate of 0)
+        strategy_std = df_results['strategy_return'].std()
+        market_std = df_results['actual'].std()
+
+        sharpe_ratio = (df_results['strategy_return'].mean() / strategy_std) * np.sqrt(252) if strategy_std > 0 else 0
+        market_sharpe = (df_results['actual'].mean() / market_std) * np.sqrt(252) if market_std > 0 else 0
+
+        # Maximum Drawdown
+        cumulative = df_results['cumulative_strategy_return']
+        running_max = cumulative.cummax()
+        drawdown = (cumulative - running_max) / running_max
+        max_drawdown = drawdown.min()
+
         # Plot results
         plt.figure(figsize=(14, 7))
         plt.plot(df_results['date'], df_results['cumulative_market_return'], label='Buy and Hold', alpha=0.7)
@@ -998,6 +1758,7 @@ def backtest_strategy(threshold=0.1):
         plt.ylabel('Cumulative Return (%)')
         plt.legend()
         plt.grid(True)
+        plt.xticks(rotation=45)
         plt.tight_layout()
         plt.savefig(os.path.join(TEST_RESULTS_DIR, 'backtest_results.png'))
 
@@ -1020,8 +1781,32 @@ def backtest_strategy(threshold=0.1):
         plt.ylabel('Cumulative Price Change (%)')
         plt.legend()
         plt.grid(True)
+        plt.xticks(rotation=45)
         plt.tight_layout()
         plt.savefig(os.path.join(TEST_RESULTS_DIR, 'trading_signals.png'))
+
+        # Plot regime-specific performance if available
+        if USE_MARKET_REGIMES and 'regime' in df_results.columns:
+            plt.figure(figsize=(14, 10))
+
+            # Plot performance by regime
+            regime_returns = {}
+            for regime_id, regime_name in enumerate(['Normal', 'Trending', 'Mean-Rev', 'Volatile']):
+                regime_data = df_results[df_results['regime'] == regime_id]
+                if not regime_data.empty:
+                    regime_returns[regime_name] = regime_data['strategy_return'].cumsum()
+
+            # Plot regime-specific returns
+            for regime_name, returns in regime_returns.items():
+                plt.plot(returns.index, returns.values, label=f'{regime_name} Regime')
+
+            plt.title('Strategy Performance by Market Regime')
+            plt.xlabel('Trade Number')
+            plt.ylabel('Cumulative Return (%)')
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(os.path.join(TEST_RESULTS_DIR, 'regime_performance.png'))
 
         # Log results
         logger.info(f"Backtest Results:")
@@ -1030,17 +1815,36 @@ def backtest_strategy(threshold=0.1):
         logger.info(f"Win rate: {win_rate:.2%}")
         logger.info(f"Market return: {market_return:.2f}%")
         logger.info(f"Strategy return: {strategy_return:.2f}%")
+        logger.info(f"Sharpe ratio (Strategy): {sharpe_ratio:.2f}")
+        logger.info(f"Sharpe ratio (Market): {market_sharpe:.2f}")
+        logger.info(f"Maximum Drawdown: {max_drawdown:.2%}")
 
         # Save detailed backtest results
         df_results.to_csv(os.path.join(TEST_RESULTS_DIR, 'backtest_detailed.csv'))
 
-        return {
-            'total_trades': total_trades,
-            'winning_trades': winning_trades,
-            'win_rate': win_rate,
-            'market_return': market_return,
-            'strategy_return': strategy_return
+        # Save backtest summary
+        backtest_summary = {
+            'total_trades': int(total_trades),
+            'winning_trades': int(winning_trades),
+            'win_rate': float(win_rate),
+            'market_return': float(market_return),
+            'strategy_return': float(strategy_return),
+            'sharpe_ratio': float(sharpe_ratio),
+            'market_sharpe': float(market_sharpe),
+            'max_drawdown': float(max_drawdown),
+            'threshold': float(threshold),
+            'confidence_filtering': CONFIDENCE_FILTERING,
+            'risk_management': RISK_MANAGEMENT,
+            'market_regimes': USE_MARKET_REGIMES,
+            'timeframe': 'H1',
+            'symbol': SYMBOL,
+            'backtest_period': f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
         }
+
+        with open(os.path.join(TEST_RESULTS_DIR, 'backtest_summary.json'), 'w') as f:
+            json.dump(backtest_summary, f, indent=4)
+
+        return backtest_summary
 
     except Exception as e:
         logger.error(f"Error during backtesting: {e}")
@@ -1052,13 +1856,80 @@ def backtest_strategy(threshold=0.1):
         mt5.shutdown()
 
 
+def run_all_thresholds():
+    """
+    Run backtest with different thresholds to find optimal entry/exit points
+    """
+    thresholds = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5]
+    results = []
+
+    for threshold in thresholds:
+        logger.info(f"Running backtest with threshold {threshold}...")
+        result = backtest_strategy(threshold=threshold)
+        if result:
+            result['threshold'] = threshold
+            results.append(result)
+
+    # Compile results
+    if results:
+        df = pd.DataFrame(results)
+
+        # Plot threshold vs performance
+        plt.figure(figsize=(14, 10))
+
+        plt.subplot(2, 2, 1)
+        plt.plot(df['threshold'], df['strategy_return'], marker='o')
+        plt.title('Strategy Return vs Threshold')
+        plt.xlabel('Threshold')
+        plt.ylabel('Return (%)')
+        plt.grid(True)
+
+        plt.subplot(2, 2, 2)
+        plt.plot(df['threshold'], df['win_rate'], marker='o')
+        plt.title('Win Rate vs Threshold')
+        plt.xlabel('Threshold')
+        plt.ylabel('Win Rate')
+        plt.grid(True)
+
+        plt.subplot(2, 2, 3)
+        plt.plot(df['threshold'], df['total_trades'], marker='o')
+        plt.title('Trade Count vs Threshold')
+        plt.xlabel('Threshold')
+        plt.ylabel('Number of Trades')
+        plt.grid(True)
+
+        plt.subplot(2, 2, 4)
+        plt.plot(df['threshold'], df['sharpe_ratio'], marker='o')
+        plt.title('Sharpe Ratio vs Threshold')
+        plt.xlabel('Threshold')
+        plt.ylabel('Sharpe Ratio')
+        plt.grid(True)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(TEST_RESULTS_DIR, 'threshold_optimization.png'))
+
+        # Save results
+        df.to_csv(os.path.join(TEST_RESULTS_DIR, 'threshold_comparison.csv'), index=False)
+
+        # Determine optimal threshold based on Sharpe ratio
+        best_idx = df['sharpe_ratio'].idxmax()
+        optimal_threshold = df.loc[best_idx, 'threshold']
+
+        logger.info(f"Optimal threshold: {optimal_threshold} (Sharpe: {df.loc[best_idx, 'sharpe_ratio']:.2f})")
+
+        return optimal_threshold
+
+    return None
+
+
 def main():
     # Make sure model and scaler exist
     model_path = os.path.join(MODEL_DIR, 'final_model.h5')
+    ensemble_dir = os.path.join(MODEL_DIR, 'ensemble')
     scaler_path = os.path.join(MODEL_DIR, 'scaler.pkl')
 
-    if not os.path.exists(model_path):
-        logger.error(f"Model file not found: {model_path}")
+    if not (os.path.exists(model_path) or os.path.exists(ensemble_dir)):
+        logger.error(f"Neither model file nor ensemble directory found")
         return
 
     if not os.path.exists(scaler_path):
@@ -1070,18 +1941,28 @@ def main():
     metrics = evaluate_model()
 
     if metrics:
-        # Run backtest with different thresholds
-        thresholds = [0.05, 0.1, 0.2, 0.3]
+        # Run threshold optimization
+        logger.info("Running threshold optimization...")
+        optimal_threshold = run_all_thresholds()
 
-        for threshold in thresholds:
-            logger.info(f"Running backtest with threshold {threshold}...")
-            backtest_metrics = backtest_strategy(threshold=threshold)
+        if optimal_threshold:
+            # Run final backtest with optimal threshold
+            logger.info(f"Running final backtest with optimal threshold {optimal_threshold}...")
+            backtest_strategy(threshold=optimal_threshold)
+        else:
+            # Run backtest with different thresholds
+            thresholds = [0.05, 0.1, 0.2, 0.3]
 
-            if backtest_metrics:
-                logger.info(f"Threshold {threshold} results:")
-                logger.info(f"Total trades: {backtest_metrics['total_trades']}")
-                logger.info(f"Win rate: {backtest_metrics['win_rate']:.2%}")
-                logger.info(f"Strategy return: {backtest_metrics['strategy_return']:.2f}%")
+            for threshold in thresholds:
+                logger.info(f"Running backtest with threshold {threshold}...")
+                backtest_metrics = backtest_strategy(threshold=threshold)
+
+                if backtest_metrics:
+                    logger.info(f"Threshold {threshold} results:")
+                    logger.info(f"Total trades: {backtest_metrics['total_trades']}")
+                    logger.info(f"Win rate: {backtest_metrics['win_rate']:.2%}")
+                    logger.info(f"Strategy return: {backtest_metrics['strategy_return']:.2f}%")
+                    logger.info(f"Sharpe ratio: {backtest_metrics['sharpe_ratio']:.2f}")
 
     logger.info("Testing completed successfully")
 
