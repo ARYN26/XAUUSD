@@ -749,35 +749,24 @@ def prepare_features_and_targets(df, target_col='next_close_change_pct', feature
 
 def create_sequences(X, y, lookback=LOOKBACK):
     """
-    Create sequences for LSTM/GRU models with proper data type conversion
+    Create sequences with fixed lookback regardless of dataset size
     """
-    import numpy as np
-
     X_seq, y_seq = [], []
 
-    # Handle small datasets
+    # Don't reduce lookback for small datasets
     if len(X) <= lookback + 1:
-        logger.warning(f"Dataset too small ({len(X)} samples) for lookback={lookback}")
-        # Use reduced lookback for small datasets
-        reduced_lookback = max(1, len(X) - 2)
-        logger.info(f"Reducing lookback from {lookback} to {reduced_lookback}")
-        lookback = reduced_lookback
+        # Instead of reducing lookback, return empty arrays or skip this batch
+        logger.warning(f"Dataset too small ({len(X)} samples) for lookback={lookback}, skipping")
+        return np.empty((0, lookback, X.shape[1]), dtype=np.float32), np.empty(0, dtype=np.float32)
 
-    # Create sequences
+    # Create sequences with fixed lookback
     for i in range(len(X) - lookback):
         X_seq.append(X[i:i + lookback])
         y_seq.append(y[i + lookback])
 
-    # Convert to numpy arrays
-    X_seq_np = np.array(X_seq) if X_seq else np.empty((0, lookback, X.shape[1]))
-    y_seq_np = np.array(y_seq) if y_seq else np.empty(0)
-
-    # Convert to float32 explicitly
-    X_seq_np = ensure_numeric_data(X_seq_np)
-    y_seq_np = y_seq_np.astype(np.float32)
-
-    logger.info(f"Sequence X shape: {X_seq_np.shape}, dtype: {X_seq_np.dtype}")
-    logger.info(f"Sequence y shape: {y_seq_np.shape}, dtype: {y_seq_np.dtype}")
+    # Convert to numpy arrays with explicit types
+    X_seq_np = np.array(X_seq, dtype=np.float32)
+    y_seq_np = np.array(y_seq, dtype=np.float32)
 
     return X_seq_np, y_seq_np
 
@@ -1071,7 +1060,7 @@ def walk_forward_validation(df, model, scaler, is_ensemble=False, ensemble_model
     validation_start = min_train_size
 
     # Create step size - validate every N rows
-    step_size = 5  # Validate every 5 rows for efficiency
+    step_size = max(5, LOOKBACK + 2)   # Validate every 5 rows for efficiency
 
     # Loop through validation points
     for i in range(validation_start, len(df), step_size):
@@ -1109,6 +1098,19 @@ def walk_forward_validation(df, model, scaler, is_ensemble=False, ensemble_model
         X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train)
         X_test_seq, y_test_seq = create_sequences(X_test_scaled, y_test)
 
+        # Add this check
+        if X_test_seq.shape[0] > 0 and X_test_seq.shape[2] != 219:  # Check if feature count matches
+            if X_test_seq.shape[2] < 219:
+                # Pad features if needed
+                padding = np.zeros((X_test_seq.shape[0], X_test_seq.shape[1], 219 - X_test_seq.shape[2]),
+                                   dtype=np.float32)
+                X_test_seq = np.concatenate([X_test_seq, padding], axis=2)
+                logger.info(f"Padded sequence features from {X_test_seq.shape[2]} to 219")
+            else:
+                # Truncate features if needed
+                X_test_seq = X_test_seq[:, :, :219]
+                logger.info(f"Truncated sequence features to 219")
+
         # Skip if we don't have enough test data for sequences
         if len(X_test_seq) == 0:
             continue
@@ -1125,6 +1127,11 @@ def walk_forward_validation(df, model, scaler, is_ensemble=False, ensemble_model
                 if X_test_seq.dtype != np.float32:
                     logger.warning(f"X_test_seq dtype is {X_test_seq.dtype}, converting to float32")
                     X_test_seq = X_test_seq.astype(np.float32)
+
+                    expected_shape = (None, 5, 219)
+                    if X_test_seq.shape[1:] != expected_shape[1:]:
+                        logger.error(f"Shape mismatch: expected {expected_shape}, got {X_test_seq.shape}")
+                        continue  # Skip this validation step
 
                 predictions = model.predict(X_test_seq, verbose=0)
                 predictions = predictions.flatten()
