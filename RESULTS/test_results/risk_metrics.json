@@ -1,0 +1,8 @@
+{
+    "kelly_long": 1.0,
+    "kelly_short": 0.0,
+    "kelly_combined": 1.0,
+    "position_size_long": 0.5,
+    "position_size_short": 0.0,
+    "position_size_combined": 0.5
+}
